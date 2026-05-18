@@ -1,6 +1,6 @@
 {
   "name": "@gitlawb/openclaude",
-  "version": "0.13.0",
+  "version": "0.13.0-gacbert.1",
   "description": "OpenClaude opens coding-agent workflows to any LLM — OpenAI, Gemini, DeepSeek, Ollama, and 200+ models",
   "type": "module",
   "bin": {
@@ -24,6 +24,7 @@
   ],
   "scripts": {
     "build": "bun run scripts/build.ts",
+    "build:gacbert": "bun run build && bun run scripts/apply-gacbert-runtime-patches.ts",
     "integrations:generate": "bun run scripts/generate-integrations-artifacts.ts",
     "integrations:check": "bun run scripts/generate-integrations-artifacts.ts --check",
     "dev": "bun run build && node dist/cli.mjs",
@@ -65,7 +66,7 @@
     "doctor:report": "bun run scripts/system-check.ts --out reports/doctor-runtime.json",
     "hardening:check": "bun run smoke && bun run doctor:runtime",
     "hardening:strict": "bun run typecheck && bun run hardening:check",
-    "prepack": "npm run build"
+    "prepack": "bun run build:gacbert"
   },
   "dependencies": {
     "@alcalzone/ansi-tokenize": "0.3.0",

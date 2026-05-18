@@ -2628,6 +2628,8 @@ async function run(): Promise<CommanderCommand> {
           tools: mcpTools
         },
         toolPermissionContext,
+        mainLoopModel: effectiveModel ?? defaultState.mainLoopModel,
+        mainLoopModelForSession: effectiveModel ?? defaultState.mainLoopModelForSession,
         effortValue: parseEffortValue(options.effort) ?? getInitialEffortSetting(),
         ...(isFastModeEnabled() && {
           fastMode: getInitialFastModeSetting(effectiveModel ?? null)
