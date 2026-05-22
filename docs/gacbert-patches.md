@@ -11,6 +11,9 @@ This fork carries the small runtime fixes required by Bert's Telegram life OS.
   `originator: "codex_cli_rs"` and `User-Agent: "codex_cli_rs/0.21.0"`.
 - Related Codex usage, web search, and cache probe requests use
   `originator: "codex_cli_rs"`.
+- Manual Spark support: `gpt-5.3-codex-spark` has explicit conservative
+  metadata (`128000` context, `32000` max output) so OpenClaude does not fall
+  back to unknown-model compaction when Telegram explicitly selects `/spark`.
 
 ## Intentionally Not Carried Forward
 
@@ -19,6 +22,8 @@ This fork carries the small runtime fixes required by Bert's Telegram life OS.
 - No blanket context-window clamp. Upstream `gpt-5.5 = 272000` is kept, and
   `gpt-5.4 = 1050000` is allowed only after validation confirms the served
   model is truly `gpt-5.4`.
+- No blanket return to Spark. Telegram may select Spark manually, but legacy
+  agent and automation aliases remain on `gpt-5.5` unless explicitly changed.
 
 ## Validation
 

@@ -218,6 +218,18 @@ test('gpt-5.5 uses conservative Codex-route context window (issue #1118)', () =>
   expect(getContextWindowForModel('gpt-5.5')).toBe(272_000)
 })
 
+test('gpt-5.3-codex-spark has explicit conservative metadata', () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
+  delete process.env.OPENAI_MODEL
+
+  expect(getContextWindowForModel('gpt-5.3-codex-spark')).toBe(128_000)
+  expect(getModelMaxOutputTokens('gpt-5.3-codex-spark')).toEqual({
+    default: 32_000,
+    upperLimit: 32_000,
+  })
+})
+
 test('gpt-5.4 family uses provider-specific context and output caps', () => {
   process.env.CLAUDE_CODE_USE_OPENAI = '1'
   delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS

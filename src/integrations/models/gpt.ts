@@ -35,6 +35,7 @@ export default [
   // window" mid-turn (issue #1118). Use the conservative Codex limit so
   // compaction kicks in before the request fails.
   gptModel('gpt-5.5', 'GPT-5.5', 272_000, 128_000),
+  gptModel('gpt-5.3-codex-spark', 'GPT-5.3-Codex-Spark', 128_000, 32_000),
   gptModel('gpt-5.5-mini', 'GPT-5.5 Mini', 400_000, 128_000),
   gptModel('gpt-5.5-nano', 'GPT-5.5 Nano', 400_000, 128_000),
   gptModel('gpt-5.4', 'GPT-5.4', 1_050_000, 128_000),
