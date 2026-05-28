@@ -14,6 +14,18 @@ This fork carries the small runtime fixes required by Bert's Telegram life OS.
 - Manual Spark support: `gpt-5.3-codex-spark` has explicit conservative
   metadata (`128000` context, `32000` max output) so OpenClaude does not fall
   back to unknown-model compaction when Telegram explicitly selects `/spark`.
+- Spark streamed tool-call arguments: the Codex SSE parser
+  (`src/services/api/codexShim.ts`) now recovers function-call `arguments`
+  delivered on `response.function_call_arguments.done` / `response.output_item.done`
+  in addition to `response.function_call_arguments.delta`. `gpt-5.3-codex-spark`
+  sends the full arguments on the completed item rather than as deltas, so
+  without this every spark tool call arrived with empty input (`{}`). Guarded by
+  a per-block `argsStreamed` flag so delta-streaming models (gpt-5.5) are not
+  double-appended. Covered by streaming regression tests in `codexShim.test.ts`.
+- Opus 4.8 catalog: registered `opus48` / `claude-opus-4-8`
+  (`configs.ts`, `integrations/models/claude.ts`) and bumped the firstParty
+  `getDefaultOpusModel()` default + display/labels (`utils/model/model.ts`,
+  `constants/prompts.ts`) so the bare `opus` alias resolves to Opus 4.8.
 
 ## Intentionally Not Carried Forward
 

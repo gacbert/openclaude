@@ -792,7 +792,7 @@ export async function* codexStreamToAnthropic(
   const messageId = makeMessageId()
   const toolBlocksByItemId = new Map<
     string,
-    { index: number; toolUseId: string }
+    { index: number; toolUseId: string; argsStreamed: boolean }
   >()
   let activeTextBlockIndex: number | null = null
   const thinkFilter = createThinkTagFilter()
@@ -853,10 +853,12 @@ export async function* codexStreamToAnthropic(
         yield* closeActiveTextBlock()
         const blockIndex = nextContentBlockIndex++
         const toolUseId = item.call_id ?? item.id ?? `call_${blockIndex}`
-        toolBlocksByItemId.set(String(item.id ?? toolUseId), {
+        const toolEntry = {
           index: blockIndex,
           toolUseId,
-        })
+          argsStreamed: false,
+        }
+        toolBlocksByItemId.set(String(item.id ?? toolUseId), toolEntry)
         sawToolUse = true
 
         yield {
@@ -879,6 +881,7 @@ export async function* codexStreamToAnthropic(
               partial_json: item.arguments,
             },
           }
+          toolEntry.argsStreamed = true
         }
       }
       continue
@@ -912,13 +915,41 @@ export async function* codexStreamToAnthropic(
     if (event.event === 'response.function_call_arguments.delta') {
       const toolBlock = toolBlocksByItemId.get(String(payload.item_id ?? ''))
       if (toolBlock) {
+        const partial = payload.delta ?? ''
         yield {
           type: 'content_block_delta',
           index: toolBlock.index,
           delta: {
             type: 'input_json_delta',
-            partial_json: payload.delta ?? '',
+            partial_json: partial,
           },
+        }
+        if (partial) toolBlock.argsStreamed = true
+      }
+      continue
+    }
+
+    // Some Codex models (notably gpt-5.3-codex-spark) deliver the complete
+    // tool-call arguments in a single done event instead of streaming
+    // function_call_arguments.delta chunks. Recover them here so the tool
+    // call doesn't reach the client with empty input ({}). Guarded by
+    // argsStreamed so models that DID stream deltas don't get arguments
+    // appended twice (which would corrupt the accumulated JSON).
+    if (event.event === 'response.function_call_arguments.done') {
+      const toolBlock = toolBlocksByItemId.get(String(payload.item_id ?? ''))
+      if (toolBlock && !toolBlock.argsStreamed) {
+        const finalArgs =
+          typeof payload.arguments === 'string' ? payload.arguments : ''
+        if (finalArgs && finalArgs !== '{}') {
+          yield {
+            type: 'content_block_delta',
+            index: toolBlock.index,
+            delta: {
+              type: 'input_json_delta',
+              partial_json: finalArgs,
+            },
+          }
+          toolBlock.argsStreamed = true
         }
       }
       continue
@@ -929,6 +960,25 @@ export async function* codexStreamToAnthropic(
       if (item?.type === 'function_call') {
         const toolBlock = toolBlocksByItemId.get(String(item.id ?? ''))
         if (toolBlock) {
+          // Last-resort argument recovery: if no deltas and no
+          // function_call_arguments.done carried the input, the completed
+          // item still has the full arguments string. Without this, spark
+          // tool calls arrive with empty input.
+          if (!toolBlock.argsStreamed) {
+            const finalArgs =
+              typeof item.arguments === 'string' ? item.arguments : ''
+            if (finalArgs && finalArgs !== '{}') {
+              yield {
+                type: 'content_block_delta',
+                index: toolBlock.index,
+                delta: {
+                  type: 'input_json_delta',
+                  partial_json: finalArgs,
+                },
+              }
+              toolBlock.argsStreamed = true
+            }
+          }
           yield {
             type: 'content_block_stop',
             index: toolBlock.index,

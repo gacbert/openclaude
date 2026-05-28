@@ -70,6 +70,46 @@ async function collectStreamEventTypes(responseText: string): Promise<string[]> 
   return events
 }
 
+async function collectStreamedToolCalls(
+  responseText: string,
+  model: string,
+): Promise<Array<{ name: string; input: unknown }>> {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(responseText))
+      controller.close()
+    },
+  })
+
+  const blocks = new Map<number, { name: string; json: string }>()
+  for await (const event of codexStreamToAnthropic(new Response(stream), model)) {
+    const e = event as {
+      type: string
+      index?: number
+      content_block?: { type?: string; name?: string }
+      delta?: { type?: string; partial_json?: string }
+    }
+    if (
+      e.type === 'content_block_start' &&
+      e.content_block?.type === 'tool_use' &&
+      typeof e.index === 'number'
+    ) {
+      blocks.set(e.index, { name: e.content_block.name ?? '', json: '' })
+    } else if (
+      e.type === 'content_block_delta' &&
+      e.delta?.type === 'input_json_delta' &&
+      typeof e.index === 'number'
+    ) {
+      const b = blocks.get(e.index)
+      if (b) b.json += e.delta.partial_json ?? ''
+    }
+  }
+  return [...blocks.values()].map((b) => ({
+    name: b.name,
+    input: b.json ? JSON.parse(b.json) : {},
+  }))
+}
+
 async function importFreshProviderConfigModule() {
   return import(`./providerConfig.js?ts=${Date.now()}-${Math.random()}`)
 }
@@ -930,6 +970,61 @@ describe('Codex request translation', () => {
       'message_delta',
       'message_stop',
     ])
+  })
+
+  test('recovers tool-call arguments delivered only on output_item.done (spark)', async () => {
+    // gpt-5.3-codex-spark delivers the full function-call arguments on the
+    // completed item rather than via response.function_call_arguments.delta
+    // events. Regression for blank tool calls (input: {}).
+    const args = '{"skill":"black-swan-tracker","args":""}'
+    const responseText = [
+      'event: response.output_item.added',
+      `data: {"type":"response.output_item.added","item":{"id":"fc_1","call_id":"call_1","type":"function_call","name":"Skill","arguments":""},"output_index":0,"sequence_number":0}`,
+      '',
+      'event: response.output_item.done',
+      `data: {"type":"response.output_item.done","item":{"id":"fc_1","call_id":"call_1","type":"function_call","name":"Skill","arguments":${JSON.stringify(args)}},"output_index":0,"sequence_number":1}`,
+      '',
+      'event: response.completed',
+      `data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.3-codex-spark","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"Skill","arguments":${JSON.stringify(args)}}],"usage":{"input_tokens":2,"output_tokens":1}},"sequence_number":2}`,
+      '',
+    ].join('\n')
+
+    const tools = await collectStreamedToolCalls(responseText, 'gpt-5.3-codex-spark')
+
+    expect(tools).toEqual([
+      { name: 'Skill', input: { skill: 'black-swan-tracker', args: '' } },
+    ])
+  })
+
+  test('does not double-append arguments when they stream via deltas (gpt-5.5)', async () => {
+    // gpt-5.5 streams arguments as function_call_arguments.delta chunks AND
+    // the completed item also carries the full arguments. The argsStreamed
+    // guard must prevent appending them twice (which would corrupt the JSON).
+    const args = '{"q":"x"}'
+    const responseText = [
+      'event: response.output_item.added',
+      `data: {"type":"response.output_item.added","item":{"id":"fc_2","call_id":"call_2","type":"function_call","name":"search","arguments":""},"output_index":0,"sequence_number":0}`,
+      '',
+      'event: response.function_call_arguments.delta',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"fc_2","delta":"{\\"q\\":","sequence_number":1}',
+      '',
+      'event: response.function_call_arguments.delta',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"fc_2","delta":"\\"x\\"}","sequence_number":2}',
+      '',
+      'event: response.function_call_arguments.done',
+      `data: {"type":"response.function_call_arguments.done","item_id":"fc_2","arguments":${JSON.stringify(args)},"sequence_number":3}`,
+      '',
+      'event: response.output_item.done',
+      `data: {"type":"response.output_item.done","item":{"id":"fc_2","call_id":"call_2","type":"function_call","name":"search","arguments":${JSON.stringify(args)}},"output_index":0,"sequence_number":4}`,
+      '',
+      'event: response.completed',
+      `data: {"type":"response.completed","response":{"id":"resp_2","status":"completed","model":"gpt-5.5","output":[{"type":"function_call","id":"fc_2","call_id":"call_2","name":"search","arguments":${JSON.stringify(args)}}],"usage":{"input_tokens":2,"output_tokens":1}},"sequence_number":5}`,
+      '',
+    ].join('\n')
+
+    const tools = await collectStreamedToolCalls(responseText, 'gpt-5.5')
+
+    expect(tools).toEqual([{ name: 'search', input: { q: 'x' } }])
   })
 
   test('strips <think> tag block from Codex SSE text stream', async () => {
