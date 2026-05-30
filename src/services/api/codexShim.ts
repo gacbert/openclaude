@@ -616,6 +616,9 @@ export async function performCodexRequest(options: {
   if (options.credentials.accountId) {
     headers['chatgpt-account-id'] = options.credentials.accountId
   }
+  // gacbert patch: the ChatGPT Codex backend only accepts requests that
+  // impersonate the Codex CLI. Hard-set originator + User-Agent (not ??=) so
+  // they are never the upstream 'openclaude' default.
   headers.originator = 'codex_cli_rs'
   headers['User-Agent'] = 'codex_cli_rs/0.21.0'
 
@@ -792,7 +795,7 @@ export async function* codexStreamToAnthropic(
   const messageId = makeMessageId()
   const toolBlocksByItemId = new Map<
     string,
-    { index: number; toolUseId: string; argsStreamed: boolean }
+    { index: number; toolUseId: string; emittedArgs: string }
   >()
   let activeTextBlockIndex: number | null = null
   const thinkFilter = createThinkTagFilter()
@@ -853,12 +856,13 @@ export async function* codexStreamToAnthropic(
         yield* closeActiveTextBlock()
         const blockIndex = nextContentBlockIndex++
         const toolUseId = item.call_id ?? item.id ?? `call_${blockIndex}`
-        const toolEntry = {
+        const initialArgs =
+          typeof item.arguments === 'string' ? item.arguments : ''
+        toolBlocksByItemId.set(String(item.id ?? toolUseId), {
           index: blockIndex,
           toolUseId,
-          argsStreamed: false,
-        }
-        toolBlocksByItemId.set(String(item.id ?? toolUseId), toolEntry)
+          emittedArgs: initialArgs,
+        })
         sawToolUse = true
 
         yield {
@@ -872,16 +876,15 @@ export async function* codexStreamToAnthropic(
           },
         }
 
-        if (item.arguments) {
+        if (initialArgs) {
           yield {
             type: 'content_block_delta',
             index: blockIndex,
             delta: {
               type: 'input_json_delta',
-              partial_json: item.arguments,
+              partial_json: initialArgs,
             },
           }
-          toolEntry.argsStreamed = true
         }
       }
       continue
@@ -915,41 +918,43 @@ export async function* codexStreamToAnthropic(
     if (event.event === 'response.function_call_arguments.delta') {
       const toolBlock = toolBlocksByItemId.get(String(payload.item_id ?? ''))
       if (toolBlock) {
-        const partial = payload.delta ?? ''
-        yield {
-          type: 'content_block_delta',
-          index: toolBlock.index,
-          delta: {
-            type: 'input_json_delta',
-            partial_json: partial,
-          },
-        }
-        if (partial) toolBlock.argsStreamed = true
-      }
-      continue
-    }
-
-    // Some Codex models (notably gpt-5.3-codex-spark) deliver the complete
-    // tool-call arguments in a single done event instead of streaming
-    // function_call_arguments.delta chunks. Recover them here so the tool
-    // call doesn't reach the client with empty input ({}). Guarded by
-    // argsStreamed so models that DID stream deltas don't get arguments
-    // appended twice (which would corrupt the accumulated JSON).
-    if (event.event === 'response.function_call_arguments.done') {
-      const toolBlock = toolBlocksByItemId.get(String(payload.item_id ?? ''))
-      if (toolBlock && !toolBlock.argsStreamed) {
-        const finalArgs =
-          typeof payload.arguments === 'string' ? payload.arguments : ''
-        if (finalArgs && finalArgs !== '{}') {
+        const delta = typeof payload.delta === 'string' ? payload.delta : ''
+        if (delta) {
+          toolBlock.emittedArgs += delta
           yield {
             type: 'content_block_delta',
             index: toolBlock.index,
             delta: {
               type: 'input_json_delta',
-              partial_json: finalArgs,
+              partial_json: delta,
             },
           }
-          toolBlock.argsStreamed = true
+        }
+      }
+      continue
+    }
+
+    // Some Codex Responses backends (codexspark / gpt-5.3-codex-spark) deliver
+    // the *complete* function-call arguments only via the terminal
+    // `response.function_call_arguments.done` event, with zero
+    // `response.function_call_arguments.delta` events in between. Without
+    // handling `done`, the tool block closed with `input: {}` and downstream
+    // tool validation failed with "required parameter X is missing" (#1259).
+    if (event.event === 'response.function_call_arguments.done') {
+      const toolBlock = toolBlocksByItemId.get(String(payload.item_id ?? ''))
+      if (toolBlock) {
+        const fullArgs =
+          typeof payload.arguments === 'string' ? payload.arguments : ''
+        if (fullArgs && !toolBlock.emittedArgs) {
+          toolBlock.emittedArgs = fullArgs
+          yield {
+            type: 'content_block_delta',
+            index: toolBlock.index,
+            delta: {
+              type: 'input_json_delta',
+              partial_json: fullArgs,
+            },
+          }
         }
       }
       continue
@@ -960,23 +965,20 @@ export async function* codexStreamToAnthropic(
       if (item?.type === 'function_call') {
         const toolBlock = toolBlocksByItemId.get(String(item.id ?? ''))
         if (toolBlock) {
-          // Last-resort argument recovery: if no deltas and no
-          // function_call_arguments.done carried the input, the completed
-          // item still has the full arguments string. Without this, spark
-          // tool calls arrive with empty input.
-          if (!toolBlock.argsStreamed) {
-            const finalArgs =
-              typeof item.arguments === 'string' ? item.arguments : ''
-            if (finalArgs && finalArgs !== '{}') {
-              yield {
-                type: 'content_block_delta',
-                index: toolBlock.index,
-                delta: {
-                  type: 'input_json_delta',
-                  partial_json: finalArgs,
-                },
-              }
-              toolBlock.argsStreamed = true
+          // Backstop for backends that skip the dedicated `function_call_arguments.done`
+          // event entirely and only put the full arguments on `output_item.done`.
+          // Same #1259 failure mode; trust whichever channel actually carried the data.
+          const finalArgs =
+            typeof item.arguments === 'string' ? item.arguments : ''
+          if (finalArgs && !toolBlock.emittedArgs) {
+            toolBlock.emittedArgs = finalArgs
+            yield {
+              type: 'content_block_delta',
+              index: toolBlock.index,
+              delta: {
+                type: 'input_json_delta',
+                partial_json: finalArgs,
+              },
             }
           }
           yield {

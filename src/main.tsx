@@ -922,7 +922,7 @@ async function run(): Promise<CommanderCommand> {
     // terminal shell integration may mirror the process name to the tab.
     // After init() so settings.json env can also gate this (gh-4765).
     if (!isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE)) {
-      process.title = 'claude';
+      process.title = 'openclaude';
     }
 
     // Attach logging sinks so subcommand handlers can use logEvent/logError.
@@ -2020,6 +2020,8 @@ async function run(): Promise<CommanderCommand> {
     // NOTE: Model resolution happens after setup() to ensure trust is established before AWS auth
     const userSpecifiedModel = options.model === 'default' ? getDefaultMainLoopModel() : options.model;
     const userSpecifiedFallbackModel = fallbackModel === 'default' ? getDefaultMainLoopModel() : fallbackModel;
+    const hasExplicitModelOverride = userSpecifiedModel !== undefined;
+    const baseMainLoopModel = userSpecifiedModel ?? getUserSpecifiedModelSetting() ?? null;
 
     // Reuse preSetupCwd unless setup() chdir'd (worktreeEnabled). Saves a
     // getCwd() syscall in the common path.
@@ -3074,6 +3076,8 @@ async function run(): Promise<CommanderCommand> {
       mcpClients,
       autoConnectIdeFlag: ide,
       mainThreadAgentDefinition,
+      baseMainLoopModel,
+      hasExplicitModelOverride,
       disableSlashCommands,
       dynamicMcpConfig,
       strictMcpConfig,
@@ -4129,6 +4133,24 @@ async function run(): Promise<CommanderCommand> {
       authLogout
     } = await import('./cli/handlers/auth.js');
     await authLogout();
+  });
+
+  const xaiAuth = auth.command('xai').description('Sign in to xAI (Grok) with browser OAuth or device code').configureHelp(createSortedHelpConfig());
+  xaiAuth.command('login').description('Browser OAuth sign-in for an xAI account').action(async () => {
+    const { xaiLogin } = await import('./cli/handlers/xaiAuth.js');
+    await xaiLogin({ flow: 'browser' });
+  });
+  xaiAuth.command('device').description('Device-code sign-in for remote hosts (no localhost callback needed)').action(async () => {
+    const { xaiLogin } = await import('./cli/handlers/xaiAuth.js');
+    await xaiLogin({ flow: 'device-code' });
+  });
+  xaiAuth.command('logout').description('Clear stored xAI OAuth credentials').action(async () => {
+    const { xaiLogout } = await import('./cli/handlers/xaiAuth.js');
+    await xaiLogout();
+  });
+  xaiAuth.command('status').description('Show xAI OAuth credential status').action(async () => {
+    const { xaiStatus } = await import('./cli/handlers/xaiAuth.js');
+    await xaiStatus();
   });
 
   /**
