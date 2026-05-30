@@ -5,6 +5,7 @@ import { getMaxOutputTokensForModel } from '../services/api/claude.ts'
 import {
   getContextWindowForModel,
   getModelMaxOutputTokens,
+  modelSupports1M,
 } from './context.ts'
 
 const originalEnv = {
@@ -268,6 +269,16 @@ test('gpt-5.4 family keeps large max output overrides within provider limits', (
   expect(getMaxOutputTokensForModel('gpt-5.4')).toBe(128_000)
   expect(getMaxOutputTokensForModel('gpt-5.4-mini')).toBe(128_000)
   expect(getMaxOutputTokensForModel('gpt-5.4-nano')).toBe(128_000)
+})
+
+test('claude opus 4.8 uses the full 1M context window', () => {
+  delete process.env.CLAUDE_CODE_USE_OPENAI
+  delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
+  delete process.env.OPENAI_MODEL
+
+  expect(modelSupports1M('claude-opus-4-8')).toBe(true)
+  expect(getContextWindowForModel('claude-opus-4-8')).toBe(1_000_000)
+  expect(getContextWindowForModel('claude-opus-4-8[1m]')).toBe(1_000_000)
 })
 
 test('MiniMax-M2.7 uses the shared gateway-safe context cap by default', () => {

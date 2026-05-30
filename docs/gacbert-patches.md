@@ -26,6 +26,9 @@ This fork carries the small runtime fixes required by Bert's Telegram life OS.
   (`configs.ts`, `integrations/models/claude.ts`) and bumped the firstParty
   `getDefaultOpusModel()` default + display/labels (`utils/model/model.ts`,
   `constants/prompts.ts`) so the bare `opus` alias resolves to Opus 4.8.
+- Opus 4.8 context accounting: `claude-opus-4-8` is treated as a default
+  1M-context model for local `/context` and auto-compact thresholds, preventing
+  early compaction at the generic 200k Claude fallback.
 
 ## Intentionally Not Carried Forward
 

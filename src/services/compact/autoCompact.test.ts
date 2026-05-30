@@ -234,6 +234,12 @@ describe('getAutoCompactThreshold', () => {
     expect(threshold).toBeGreaterThan(0)
   })
 
+  test('keeps claude opus 4.8 auto-compact threshold near the 1M window', async () => {
+    const { getAutoCompactThreshold } = await importAutoCompact()
+
+    expect(getAutoCompactThreshold('claude-opus-4-8')).toBe(967_000)
+  })
+
   test('never returns negative threshold even for unknown 3P models (issue #635)', async () => {
     const { getAutoCompactThreshold } = await importAutoCompact()
     process.env.CLAUDE_CODE_USE_OPENAI = '1'

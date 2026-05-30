@@ -60,7 +60,19 @@ export function modelSupports1M(model: string): boolean {
     return false
   }
   const canonical = getCanonicalName(model)
-  return canonical.includes('claude-sonnet-4') || canonical.includes('opus-4-6')
+  return (
+    canonical.includes('claude-sonnet-4') ||
+    canonical.includes('opus-4-8') ||
+    canonical.includes('opus-4-6')
+  )
+}
+
+function modelUsesDefault1MContext(model: string): boolean {
+  if (is1mContextDisabled()) {
+    return false
+  }
+  const canonical = getCanonicalName(model)
+  return canonical.includes('opus-4-8')
 }
 
 function shouldUseIntegrationRuntimeLimits(
@@ -97,6 +109,10 @@ export function getContextWindowForModel(
 
   // [1m] suffix — explicit client-side opt-in, respected over all detection
   if (has1mContext(model)) {
+    return 1_000_000
+  }
+
+  if (modelUsesDefault1MContext(model)) {
     return 1_000_000
   }
 

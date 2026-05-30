@@ -34,7 +34,7 @@ export default [
       supportsReasoning: true,
       supportsPreciseTokenCount: false,
     },
-    contextWindow: 200_000,
+    contextWindow: 1_000_000,
     maxOutputTokens: 8192,
   }),
   defineModel({
