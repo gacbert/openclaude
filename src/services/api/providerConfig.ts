@@ -124,6 +124,7 @@ export type ResolvedProviderRequest = {
   reasoning?: {
     effort: ReasoningEffort
   }
+  serviceTier?: string
 }
 
 export type ResolvedCodexCredentials = {
@@ -749,6 +750,8 @@ export function resolveProviderRequest(options?: {
     ? { effort: options.reasoningEffortOverride }
     : descriptor.reasoning
 
+  const serviceTier = resolveCodexServiceTier(resolvedModel)
+
   return {
     transport,
     requestedModel,
@@ -762,6 +765,7 @@ export function resolveProviderRequest(options?: {
             : DEFAULT_OPENAI_BASE_URL))
       ).replace(/\/+$/, ''),
     reasoning,
+    serviceTier,
   }
 }
 
@@ -1074,4 +1078,32 @@ export function supportsCodexReasoningEffort(model: string): boolean {
   }
 
   return /^gpt-5(?:[.-]|$)/.test(base)
+}
+
+// gacbert patch: Codex "Fast" speed tier. The ChatGPT Codex /responses backend
+// exposes a `priority` service tier (its UI display name is "Fast"; ~1.5x speed,
+// increased usage) for gpt-5.5 / gpt-5.4 ONLY. spark, mini, gpt-5.3-codex and
+// gpt-5.2 expose no service tier and the backend rejects one, so gate strictly.
+export function supportsCodexServiceTier(model: string): boolean {
+  const normalized = model.trim().toLowerCase()
+  const base = normalized.split('?', 1)[0] ?? normalized
+
+  return base === 'gpt-5.5' || base === 'gpt-5.4'
+}
+
+// gacbert patch: opt-in Codex Fast mode. OPENCLAUDE_CODEX_SERVICE_TIER, when set
+// to `priority` (or a truthy flag like 1/true/yes/on, treated as `priority`),
+// attaches `service_tier: "priority"` to requests for supported models. Confirmed
+// live: the literal value must be `priority` — sending "fast" 400s. Unknown values
+// and unsupported models yield undefined (no field added, no behaviour change).
+export function resolveCodexServiceTier(model: string): string | undefined {
+  const raw = process.env.OPENCLAUDE_CODEX_SERVICE_TIER?.trim().toLowerCase()
+  if (!raw) {
+    return undefined
+  }
+  const tier = raw === 'priority' || isEnvTruthy(raw) ? 'priority' : undefined
+  if (!tier) {
+    return undefined
+  }
+  return supportsCodexServiceTier(model) ? tier : undefined
 }

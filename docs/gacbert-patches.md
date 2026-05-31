@@ -29,11 +29,23 @@ This fork carries the small runtime fixes required by Bert's Telegram life OS.
 - Opus 4.8 context accounting: `claude-opus-4-8` is treated as a default
   1M-context model for local `/context` and auto-compact thresholds, preventing
   early compaction at the generic 200k Claude fallback.
+- Codex Fast speed tier (opt-in): `OPENCLAUDE_CODEX_SERVICE_TIER`, when set to
+  `priority` (or a truthy flag `1`/`true`/`yes`/`on`, treated as `priority`),
+  attaches `service_tier: "priority"` to Codex `/responses` requests. The
+  ChatGPT Codex backend's model catalog exposes this tier (UI name "Fast",
+  ~1.5x speed, increased usage) for `gpt-5.5` / `gpt-5.4` only, so it is gated
+  by `supportsCodexServiceTier()` (`providerConfig.ts`) — spark, mini,
+  `gpt-5.3-codex` and `gpt-5.2` never receive it. Resolved in
+  `resolveProviderRequest()` onto `ResolvedProviderRequest.serviceTier` and
+  injected in `codexShim.ts` alongside `reasoning`. Default unset = no change.
+  Covered by `providerConfig.serviceTier.test.ts`.
 
 ## Intentionally Not Carried Forward
 
-- No `OPENCLAUDE_CODEX_SERVICE_TIER=fast`; the backend rejected it with
-  `400 Unsupported service_tier: fast`.
+- No literal `OPENCLAUDE_CODEX_SERVICE_TIER=fast`; the backend rejects the
+  literal value `fast` with `400 Unsupported service_tier: fast`. The valid
+  Fast-tier value is `priority` (the catalog's UI display name for it is
+  "Fast"), now supported via the opt-in patch above.
 - No blanket context-window clamp. Upstream `gpt-5.5 = 272000` is kept, and
   `gpt-5.4 = 1050000` is allowed only after validation confirms the served
   model is truly `gpt-5.4`.

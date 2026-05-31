@@ -20,6 +20,7 @@ requireContains('headless model routing', 'mainLoopModel: effectiveModel ?? defa
 requireContains('headless model-for-session routing', 'mainLoopModelForSession: effectiveModel ?? defaultState.mainLoopModelForSession')
 requireContains('codex responses originator', 'headers.originator = "codex_cli_rs"')
 requireContains('codex responses user agent', 'headers["User-Agent"] = "codex_cli_rs/0.21.0"')
+requireContains('codex service tier env flag', 'OPENCLAUDE_CODEX_SERVICE_TIER')
 
 const remainingOpenClaudeOriginators = countMatches(/originator: "openclaude"/g)
 if (remainingOpenClaudeOriginators !== 0) {
