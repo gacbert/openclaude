@@ -86,14 +86,12 @@ const AgentJsonSchema = lazySchema(() =>
     mcpServers: z.array(AgentMcpServerSpecSchema()).optional(),
     hooks: HooksSchema().optional(),
     maxTurns: z.number().int().positive().optional(),
+    maxSteps: z.number().int().positive().optional(),
     skills: z.array(z.string()).optional(),
     initialPrompt: z.string().optional(),
     memory: z.enum(['user', 'project', 'local']).optional(),
     background: z.boolean().optional(),
-    isolation: (process.env.USER_TYPE === 'ant'
-      ? z.enum(['worktree', 'remote'])
-      : z.enum(['worktree'])
-    ).optional(),
+    isolation: z.enum(['worktree']).optional(),
   }),
 )
 
@@ -115,6 +113,7 @@ export type BaseAgentDefinition = {
   effort?: EffortValue
   permissionMode?: PermissionMode
   maxTurns?: number // Maximum number of agentic turns before stopping
+  maxSteps?: number // Maximum number of tool-use steps before forcing a final summary
   filename?: string // Original filename without .md extension (for user/project/managed agents)
   baseDir?: string
   criticalSystemReminder_EXPERIMENTAL?: string // Short message re-injected at every user turn
@@ -122,7 +121,7 @@ export type BaseAgentDefinition = {
   background?: boolean // Always run as background task when spawned
   initialPrompt?: string // Prepended to the first user turn (slash commands work)
   memory?: AgentMemoryScope // Persistent memory scope
-  isolation?: 'worktree' | 'remote' // Run in an isolated git worktree, or remotely in CCR (internal-only)
+  isolation?: 'worktree' // Run in an isolated git worktree
   pendingSnapshotUpdate?: { snapshotTimestamp: string }
   /** Omit CLAUDE.md hierarchy from the agent's userContext. Read-only agents
    * (Explore, Plan) don't need commit/PR/lint guidelines — the main agent has
@@ -149,6 +148,11 @@ export type CustomAgentDefinition = BaseAgentDefinition & {
   baseDir?: string
 }
 
+export type SdkAgentDefinition = BaseAgentDefinition & {
+  getSystemPrompt: () => string
+  source: 'sdk'
+}
+
 // Plugin agents - similar to custom but with plugin metadata, prompt stored via closure
 export type PluginAgentDefinition = BaseAgentDefinition & {
   getSystemPrompt: () => string
@@ -161,6 +165,7 @@ export type PluginAgentDefinition = BaseAgentDefinition & {
 export type AgentDefinition =
   | BuiltInAgentDefinition
   | CustomAgentDefinition
+  | SdkAgentDefinition
   | PluginAgentDefinition
 
 // Type guards for runtime type checking
@@ -173,7 +178,11 @@ export function isBuiltInAgent(
 export function isCustomAgent(
   agent: AgentDefinition,
 ): agent is CustomAgentDefinition {
-  return agent.source !== 'built-in' && agent.source !== 'plugin'
+  return (
+    agent.source !== 'built-in' &&
+    agent.source !== 'plugin' &&
+    agent.source !== 'sdk'
+  )
 }
 
 export function isPluginAgent(
@@ -198,6 +207,7 @@ export function getActiveAgentsFromList(
   const projectAgents = allAgents.filter(a => a.source === 'projectSettings')
   const managedAgents = allAgents.filter(a => a.source === 'policySettings')
   const flagAgents = allAgents.filter(a => a.source === 'flagSettings')
+  const sdkAgents = allAgents.filter(a => a.source === 'sdk')
 
   const agentGroups = [
     builtInAgents,
@@ -205,6 +215,7 @@ export function getActiveAgentsFromList(
     userAgents,
     projectAgents,
     flagAgents,
+    sdkAgents,
     managedAgents,
   ]
 
@@ -487,6 +498,7 @@ export function parseAgentFromJson(
         : {}),
       ...(parsed.hooks ? { hooks: parsed.hooks } : {}),
       ...(parsed.maxTurns !== undefined ? { maxTurns: parsed.maxTurns } : {}),
+      ...(parsed.maxSteps !== undefined ? { maxSteps: parsed.maxSteps } : {}),
       ...(parsed.skills && parsed.skills.length > 0
         ? { skills: parsed.skills }
         : {}),
@@ -594,10 +606,9 @@ export function parseAgentFromMarkdown(
       }
     }
 
-    // Parse isolation mode. 'remote' is internal-only; external builds reject it at parse time.
-    type IsolationMode = 'worktree' | 'remote'
-    const VALID_ISOLATION_MODES: readonly IsolationMode[] =
-      process.env.USER_TYPE === 'ant' ? ['worktree', 'remote'] : ['worktree']
+    // Parse isolation mode.
+    type IsolationMode = 'worktree'
+    const VALID_ISOLATION_MODES: readonly IsolationMode[] = ['worktree']
     const isolationRaw = frontmatter['isolation'] as string | undefined
     let isolation: IsolationMode | undefined
     if (isolationRaw !== undefined) {
@@ -640,6 +651,15 @@ export function parseAgentFromMarkdown(
     if (maxTurnsRaw !== undefined && maxTurns === undefined) {
       logForDebugging(
         `Agent file ${filePath} has invalid maxTurns '${maxTurnsRaw}'. Must be a positive integer.`,
+      )
+    }
+
+    // Parse maxSteps from frontmatter
+    const maxStepsRaw = frontmatter['maxSteps']
+    const maxSteps = parsePositiveIntFromFrontmatter(maxStepsRaw)
+    if (maxStepsRaw !== undefined && maxSteps === undefined) {
+      logForDebugging(
+        `Agent file ${filePath} has invalid maxSteps '${maxStepsRaw}'. Must be a positive integer.`,
       )
     }
 
@@ -731,6 +751,7 @@ export function parseAgentFromMarkdown(
         ? { permissionMode: permissionModeRaw as PermissionMode }
         : {}),
       ...(maxTurns !== undefined ? { maxTurns } : {}),
+      ...(maxSteps !== undefined ? { maxSteps } : {}),
       ...(background ? { background } : {}),
       ...(memory ? { memory } : {}),
       ...(isolation ? { isolation } : {}),

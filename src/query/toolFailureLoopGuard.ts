@@ -6,6 +6,7 @@ const DEFAULT_TOOL_FAILURE_LOOP_THRESHOLD = 3
 const MAX_FALLBACK_CATEGORY_LENGTH = 120
 
 export type ToolFailureLoopGuardState = {
+  persistentSignatureCounts: Map<string, number>
   signatureCounts: Map<string, number>
   categoryCounts: Map<string, number>
   pathCounts: Map<string, number>
@@ -25,6 +26,7 @@ export type ToolFailureLoopGuardDecision =
 
 export function createToolFailureLoopGuardState(): ToolFailureLoopGuardState {
   return {
+    persistentSignatureCounts: new Map(),
     signatureCounts: new Map(),
     categoryCounts: new Map(),
     pathCounts: new Map(),
@@ -65,20 +67,34 @@ export function updateToolFailureLoopGuard(params: {
   )
   const failures: FailureInfo[] = []
   let hasSuccess = false
+  const successfulToolNames = new Set<string>()
+  const successfulMutationPaths = new Set<string>()
 
   for (const block of getToolResultBlocks(params.toolResults)) {
     const content = toolResultContentToString(block.content)
+    const toolUse = toolUseById.get(String(block.tool_use_id ?? ''))
 
     if (block.is_error !== true) {
       hasSuccess = true
+      if (toolUse?.name) {
+        successfulToolNames.add(toolUse.name)
+      }
+      if (toolUse && isMutatingFileTool(toolUse.name)) {
+        const path = extractNormalizedPath(toolUse.input)
+        if (path) {
+          successfulMutationPaths.add(path)
+        }
+      }
       continue
     }
 
-    if (isIgnoredSyntheticToolResult(content)) {
+    if (
+      block.isAgentStepLimitToolResult ||
+      isIgnoredSyntheticToolResult(content)
+    ) {
       continue
     }
 
-    const toolUse = toolUseById.get(String(block.tool_use_id ?? ''))
     const toolName = toolUse?.name ?? 'unknown'
     const errorCategory = normalizeErrorCategory(content)
     failures.push({
@@ -88,25 +104,40 @@ export function updateToolFailureLoopGuard(params: {
     })
   }
 
-  if (hasSuccess) {
-    resetToolFailureLoopGuard(params.state)
-    return { tripped: false }
+  for (const toolName of successfulToolNames) {
+    resetPersistentToolSignatures(params.state, toolName)
   }
 
   for (const failure of failures) {
-    const signatureCount = incrementCounter(
-      params.state.signatureCounts,
+    const persistentSignatureCount = incrementCounter(
+      params.state.persistentSignatureCounts,
       `${failure.toolName}\0${failure.errorCategory}`,
     )
-    const categoryCount = incrementCounter(
-      params.state.categoryCounts,
-      failure.errorCategory,
-    )
-    const pathCount = failure.path
-      ? incrementCounter(params.state.pathCounts, failure.path)
-      : 0
 
-    if (pathCount >= threshold && failure.path) {
+    if (persistentSignatureCount >= threshold) {
+      return {
+        tripped: true,
+        kind: 'signature',
+        threshold,
+        toolName: failure.toolName,
+        errorCategory: failure.errorCategory,
+        message: createTripMessage({
+          kind: 'signature',
+          threshold,
+          toolName: failure.toolName,
+          errorCategory: failure.errorCategory,
+        }),
+      }
+    }
+  }
+
+  for (const failure of failures) {
+    if (!failure.path || successfulMutationPaths.has(failure.path)) {
+      continue
+    }
+
+    const pathCount = incrementCounter(params.state.pathCounts, failure.path)
+    if (pathCount >= threshold) {
       return {
         tripped: true,
         kind: 'path',
@@ -119,7 +150,22 @@ export function updateToolFailureLoopGuard(params: {
         }),
       }
     }
+  }
 
+  if (hasSuccess) {
+    resetToolFailureLoopGuard(params.state, successfulMutationPaths)
+    return { tripped: false }
+  }
+
+  for (const failure of failures) {
+    const signatureCount = incrementCounter(
+      params.state.signatureCounts,
+      `${failure.toolName}\0${failure.errorCategory}`,
+    )
+    const categoryCount = incrementCounter(
+      params.state.categoryCounts,
+      failure.errorCategory,
+    )
     if (signatureCount >= threshold) {
       return {
         tripped: true,
@@ -159,6 +205,7 @@ type ToolResultBlockLike = {
   tool_use_id?: unknown
   content?: unknown
   is_error?: unknown
+  isAgentStepLimitToolResult?: boolean
 }
 
 type FailureInfo = {
@@ -177,10 +224,36 @@ function normalizeThreshold(threshold: number | undefined): number {
   return threshold
 }
 
-function resetToolFailureLoopGuard(state: ToolFailureLoopGuardState): void {
+function resetToolFailureLoopGuard(
+  state: ToolFailureLoopGuardState,
+  successfulMutationPaths: Set<string>,
+): void {
   state.signatureCounts.clear()
   state.categoryCounts.clear()
-  state.pathCounts.clear()
+  for (const path of successfulMutationPaths) {
+    state.pathCounts.delete(path)
+  }
+}
+
+function resetPersistentToolSignatures(
+  state: ToolFailureLoopGuardState,
+  toolName: string,
+): void {
+  const prefix = `${toolName}\0`
+  for (const key of state.persistentSignatureCounts.keys()) {
+    if (key.startsWith(prefix)) {
+      state.persistentSignatureCounts.delete(key)
+    }
+  }
+}
+
+function isMutatingFileTool(toolName: string): boolean {
+  return (
+    toolName === 'Edit' ||
+    toolName === 'MultiEdit' ||
+    toolName === 'Write' ||
+    toolName === 'NotebookEdit'
+  )
 }
 
 function getToolResultBlocks(
@@ -195,7 +268,10 @@ function getToolResultBlocks(
 
     for (const block of message.message.content) {
       if (isToolResultBlock(block)) {
-        blocks.push(block)
+        blocks.push({
+          ...block,
+          isAgentStepLimitToolResult: message.isAgentStepLimitToolResult,
+        })
       }
     }
   }
@@ -221,9 +297,12 @@ function toolResultContentToString(content: unknown): string {
   }
 
   if (typeof content === 'object' && content !== null) {
-    const text = (content as { text?: unknown }).text
-    if (typeof text === 'string') {
-      return text
+    const block = content as { text?: unknown; content?: unknown }
+    if (block.text !== undefined) {
+      return toolResultContentToString(block.text)
+    }
+    if (block.content !== undefined) {
+      return toolResultContentToString(block.content)
     }
   }
 

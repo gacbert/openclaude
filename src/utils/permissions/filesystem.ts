@@ -19,7 +19,9 @@ import { checkStatsigFeatureGate_CACHED_MAY_BE_STALE } from '../../services/anal
 import type { AnyObject, Tool, ToolPermissionContext } from '../../Tool.js'
 import { FILE_READ_TOOL_NAME } from '../../tools/FileReadTool/prompt.js'
 import { getCwd } from '../cwd.js'
+import { logForDebugging } from '../debug.js'
 import { getClaudeConfigHomeDir } from '../envUtils.js'
+import { isFsInaccessible } from '../errors.js'
 import {
   getFsImplementation,
   getPathsForPermissionCheck,
@@ -332,6 +334,21 @@ export function getClaudeTempDirName(): string {
   return `claude-${uid}`
 }
 
+function ensureUsableTempDir(
+  fs: ReturnType<typeof getFsImplementation>,
+  dirPath: string,
+): void {
+  fs.mkdirSync(dirPath, { mode: 0o700 })
+  const probeDir = join(
+    dirPath,
+    `.write-probe-${process.pid}-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}`,
+  )
+  fs.mkdirSync(probeDir, { mode: 0o700 })
+  fs.rmdirSync(probeDir)
+}
+
 /**
  * Returns the Claude temp directory path with symlinks resolved.
  * Uses TMPDIR env var if set, otherwise:
@@ -361,7 +378,36 @@ export const getClaudeTempDir = memoize(function getClaudeTempDir(): string {
     // If resolution fails, use the original path
   }
 
-  return join(resolvedBaseTmpDir, getClaudeTempDirName()) + sep
+  const fullPath = join(resolvedBaseTmpDir, getClaudeTempDirName()) + sep
+
+  // Verify the directory is actually usable - on systems with restricted /tmp
+  // (container environments, systemd private tmp namespaces), the base temp dir
+  // may exist but reject mkdir/writes with EACCES.
+  try {
+    ensureUsableTempDir(fs, fullPath)
+  } catch (e: unknown) {
+    if (isFsInaccessible(e)) {
+      const fallbackDirs = [
+        join(tmpdir(), 'claude-code', getClaudeTempDirName()) + sep,
+        join(getClaudeConfigHomeDir(), 'tmp', getClaudeTempDirName()) + sep,
+      ]
+      for (const fallbackDir of fallbackDirs) {
+        try {
+          ensureUsableTempDir(fs, fallbackDir)
+          logForDebugging(
+            `Claude temp directory ${fullPath} is not writable; ` +
+              `falling back to ${fallbackDir}`,
+          )
+          return fallbackDir
+        } catch (fallbackError: unknown) {
+          if (!isFsInaccessible(fallbackError)) throw fallbackError
+        }
+      }
+    }
+    throw e
+  }
+
+  return fullPath
 })
 
 /**
@@ -438,6 +484,24 @@ function isScratchpadPath(absolutePath: string): boolean {
   return (
     normalizedPath === scratchpadDir ||
     normalizedPath.startsWith(scratchpadDir + sep)
+  )
+}
+
+function pathsEqualForPermission(a: string, b: string): boolean {
+  return normalizeCaseForComparison(normalize(a)) ===
+    normalizeCaseForComparison(normalize(b))
+}
+
+export function isOpenClaudeCommitMessagePath(absolutePath: string): boolean {
+  const expectedPath = join(getOriginalCwd(), '.git', 'OPENCLAUDE_COMMIT_MSG')
+  const expectedForms = getPathsForPermissionCheck(expectedPath)
+  const targetForms = getPathsForPermissionCheck(absolutePath)
+
+  return (
+    targetForms.length > 0 &&
+    targetForms.every(target =>
+      expectedForms.some(expected => pathsEqualForPermission(target, expected)),
+    )
   )
 }
 
@@ -1262,6 +1326,7 @@ export function checkWritePermissionForTool<Input extends AnyObject>(
   const internalEditResult = checkEditableInternalPath(
     absolutePathForEdit,
     input,
+    toolPermissionContext,
   )
   if (internalEditResult.behavior !== 'passthrough') {
     return internalEditResult
@@ -1501,6 +1566,7 @@ export function generateSuggestions(
 export function checkEditableInternalPath(
   absolutePath: string,
   input: { [key: string]: unknown },
+  toolPermissionContext?: ToolPermissionContext,
 ): PermissionResult {
   // SECURITY: Normalize path to prevent traversal bypasses via .. segments
   // This is defense-in-depth; individual helper functions also normalize
@@ -1619,6 +1685,24 @@ export function checkEditableInternalPath(
       decisionReason: {
         type: 'other',
         reason: 'Preview launch config is allowed for writing',
+      },
+    }
+  }
+
+  // /commit uses this project-local file to pass multi-line commit messages
+  // safely through shells on Windows. It is data-only and intentionally scoped
+  // to one exact file; other .git/ paths still go through safety checks.
+  if (
+    (toolPermissionContext?.mode === 'bypassPermissions' ||
+      toolPermissionContext?.mode === 'fullAccess') &&
+    isOpenClaudeCommitMessagePath(normalizedPath)
+  ) {
+    return {
+      behavior: 'allow',
+      updatedInput: input,
+      decisionReason: {
+        type: 'other',
+        reason: 'OpenClaude commit message file is allowed for writing',
       },
     }
   }

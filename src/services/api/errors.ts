@@ -25,6 +25,7 @@ import {
   NO_RESPONSE_REQUESTED,
 } from 'src/utils/messages.js'
 import {
+  getDefaultMainLoopModel,
   getDefaultMainLoopModelSetting,
   isNonCustomOpusModel,
 } from 'src/utils/model/model.js'
@@ -96,6 +97,13 @@ function mapOpenAICompatibilityFailureToAssistantMessage(options: {
         error: 'invalid_request',
       })
 
+    case 'vision_not_supported':
+      return createAssistantAPIErrorMessage({
+        content: getVisionNotSupportedErrorMessage(),
+        error: 'invalid_request',
+        errorDetails: stripOpenAICompatibilityMetadata(options.rawMessage),
+      })
+
     case 'model_not_found':
       return createAssistantAPIErrorMessage({
         content: `The selected model (${options.model}) is not available on this provider. Run ${switchCmd} to choose another model, or verify installed local models (for Ollama: ollama list).`,
@@ -104,7 +112,7 @@ function mapOpenAICompatibilityFailureToAssistantMessage(options: {
 
     case 'auth_invalid':
       return createAssistantAPIErrorMessage({
-        content: `${API_ERROR_MESSAGE_PREFIX}: Authentication failed for your OpenAI-compatible provider. Verify OPENAI_API_KEY and endpoint-specific auth requirements.`,
+        content: `${API_ERROR_MESSAGE_PREFIX}: Authentication failed for your OpenAI-compatible provider. Verify OPENAI_API_KEYS or OPENAI_API_KEY and endpoint-specific auth requirements.`,
         error: 'authentication_failed',
       })
 
@@ -224,6 +232,91 @@ export function getPromptTooLongTokenGap(
   return gap > 0 ? gap : undefined
 }
 
+const PROVIDER_MAX_TOKENS_CAP_NUMBER =
+  '([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)'
+
+const PROVIDER_MAX_TOKENS_CAP_PATTERNS = [
+  new RegExp(
+    `\\bmax_(?:completion_)?tokens\\b.{0,240}?\\bmaximum\\s+(?:output|completion)\\s+tokens?\\b[^0-9]{0,80}${PROVIDER_MAX_TOKENS_CAP_NUMBER}(?![0-9,]|\\.[0-9])`,
+    'is',
+  ),
+]
+
+function parseSafePositiveInteger(raw: string): number | undefined {
+  if (!/^(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)$/.test(raw)) {
+    return undefined
+  }
+
+  const normalized = raw.replace(/,/g, '')
+  if (!/^[0-9]+$/.test(normalized)) {
+    return undefined
+  }
+
+  const value = Number.parseInt(normalized, 10)
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    return undefined
+  }
+
+  return value
+}
+
+/**
+ * Parses provider-returned output token caps from runtime request errors.
+ * These are lower than static model metadata because gateways may account for
+ * prompt size or route-specific output limits at request time.
+ *
+ * OpenRouter-style 402 affordability errors are intentionally excluded here.
+ * Those are adjusted inside withRetry so that path has one recovery owner.
+ */
+export function parseProviderMaxTokensCap(
+  rawMessage: string,
+): number | undefined {
+  for (const pattern of PROVIDER_MAX_TOKENS_CAP_PATTERNS) {
+    const match = rawMessage.match(pattern)
+    const rawCap = match?.slice(1).find(Boolean)
+    if (!rawCap) {
+      continue
+    }
+
+    const cap = parseSafePositiveInteger(rawCap)
+    if (cap !== undefined) {
+      return cap
+    }
+  }
+
+  return undefined
+}
+
+export function getProviderMaxTokensCapFromMessage(
+  msg: AssistantMessage | undefined,
+): number | undefined {
+  if (
+    msg?.type !== 'assistant' ||
+    msg.apiError !== 'max_tokens_too_high'
+  ) {
+    return undefined
+  }
+
+  if (msg.errorDetails) {
+    return parseProviderMaxTokensCap(msg.errorDetails)
+  }
+
+  const content = msg.message?.content
+  if (!Array.isArray(content)) {
+    return undefined
+  }
+
+  const text = content
+    .filter(
+      (block): block is Extract<typeof block, { type: 'text' }> =>
+        block?.type === 'text' && typeof block.text === 'string',
+    )
+    .map(block => block.text)
+    .join('\n')
+
+  return parseProviderMaxTokensCap(text)
+}
+
 /**
  * Is this raw API error text a media-size rejection that stripImagesFromMessages
  * can fix? Reactive compact's summarize retry uses this to decide whether to
@@ -306,6 +399,31 @@ export function getRequestTooLargeErrorMessage(): string {
   return getIsNonInteractiveSession()
     ? `Request too large (${limits}). Try with a smaller file.`
     : `Request too large (${limits}). Double press esc to go back and try with a smaller file.`
+}
+
+const VISION_NOT_SUPPORTED_MESSAGE_PREFIX =
+  'The active model does not support image/vision inputs. The provider rejected the request because it contained an image. Remove the image, or'
+
+export function getVisionNotSupportedErrorMessages(): string[] {
+  return [
+    `${VISION_NOT_SUPPORTED_MESSAGE_PREFIX} switch to a vision-capable model with --model.`,
+    `${VISION_NOT_SUPPORTED_MESSAGE_PREFIX} run /model to switch to a vision-capable model.`,
+  ]
+}
+
+/**
+ * Canonical message for the `vision_not_supported` OpenAI compatibility
+ * failure (issue #1421). Returned as a stable string so that
+ * `normalizeMessagesForAPI`'s `errorToBlockTypes` map can self-heal existing
+ * transcripts by stripping `image` blocks from the preceding user message
+ * on resume.
+ */
+export function getVisionNotSupportedErrorMessage(): string {
+  const [nonInteractiveMessage, interactiveMessage] =
+    getVisionNotSupportedErrorMessages()
+  return getIsNonInteractiveSession()
+    ? nonInteractiveMessage!
+    : interactiveMessage!
 }
 export const OAUTH_ORG_NOT_ALLOWED_ERROR_MESSAGE =
   'Your account does not have access to OpenClaude. Please run /login.'
@@ -564,6 +682,18 @@ export function getAssistantMessageFromError(
     })
   }
 
+  if (error instanceof APIError) {
+    const providerMaxTokensCap = parseProviderMaxTokensCap(error.message)
+    if (providerMaxTokensCap !== undefined) {
+      return createAssistantAPIErrorMessage({
+        content: 'Provider max_tokens limit was lower than requested.',
+        apiError: 'max_tokens_too_high',
+        error: 'invalid_request',
+        errorDetails: error.message,
+      })
+    }
+  }
+
   // OpenAI-compatible transport and HTTP failures include structured category
   // markers from openaiShim.ts for actionable end-user remediation.
   if (error instanceof APIError) {
@@ -686,6 +816,18 @@ export function getAssistantMessageFromError(
       content: `${API_ERROR_MESSAGE_PREFIX}: Request rejected (429) · ${detail || 'this may be a temporary capacity issue'} — ${retryHint}`,
       error: 'rate_limit',
     })
+  }
+
+  if (!(error instanceof APIError) && error instanceof Error) {
+    const providerMaxTokensCap = parseProviderMaxTokensCap(error.message)
+    if (providerMaxTokensCap !== undefined) {
+      return createAssistantAPIErrorMessage({
+        content: 'Provider max_tokens limit was lower than requested.',
+        apiError: 'max_tokens_too_high',
+        error: 'invalid_request',
+        errorDetails: error.message,
+      })
+    }
   }
 
   // Handle prompt too long errors (Vertex returns 413, direct API returns 400)
@@ -1009,8 +1151,8 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       error: 'authentication_failed',
       content: getIsNonInteractiveSession()
-        ? `Failed to authenticate. ${API_ERROR_MESSAGE_PREFIX}: ${error.message}`
-        : `Please run /login · ${API_ERROR_MESSAGE_PREFIX}: ${error.message}`,
+        ? `Failed to authenticate. ${API_ERROR_MESSAGE_PREFIX}: Authentication failed (status ${error.status}). Check your API key configuration.`
+        : `Please run /login · ${API_ERROR_MESSAGE_PREFIX}: Authentication failed (status ${error.status}). Check your API key configuration.`,
     })
   }
 
@@ -1099,6 +1241,14 @@ function get3PModelFallbackSuggestion(model: string): string | undefined {
   }
   // @[MODEL LAUNCH]: Add a fallback suggestion chain for the new model → previous version for 3P
   const m = model.toLowerCase()
+  // Mirror the validation-time fallback chain in validateModel.ts so the error
+  // path suggests the previous Opus for the recent models too.
+  if (m.includes('opus-4-8') || m.includes('opus_4_8')) {
+    return getModelStrings().opus47
+  }
+  if (m.includes('opus-4-7') || m.includes('opus_4_7')) {
+    return getModelStrings().opus46
+  }
   // If the failing model looks like an Opus 4.6 variant, suggest the default Opus (4.1 for 3P)
   if (m.includes('opus-4-6') || m.includes('opus_4_6')) {
     return getModelStrings().opus41
@@ -1356,9 +1506,10 @@ export function getErrorMessageIfRefusal(
     ? `${API_ERROR_MESSAGE_PREFIX}: OpenClaude is unable to respond to this request, which appears to violate our Usage Policy (${usagePolicyUrl}). Try rephrasing the request or attempting a different approach.`
     : `${API_ERROR_MESSAGE_PREFIX}: OpenClaude is unable to respond to this request, which appears to violate our Usage Policy (${usagePolicyUrl}). Please double press esc to edit your last message or start a new session for OpenClaude to assist with a different task.`
 
+  const defaultModel = getDefaultMainLoopModel()
   const modelSuggestion =
-    model !== 'claude-sonnet-4-20250514'
-      ? ' If you are seeing this refusal repeatedly, try running /model claude-sonnet-4-20250514 to switch models.'
+    model !== defaultModel
+      ? ` If you are seeing this refusal repeatedly, try running /model ${defaultModel} to switch models.`
       : ''
 
   return createAssistantAPIErrorMessage({

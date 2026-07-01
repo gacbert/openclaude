@@ -176,7 +176,7 @@ export interface SystemPromptSectionDetail {
 
 interface Agent {
   agentType: string
-  source: SettingSource | 'built-in' | 'plugin'
+  source: SettingSource | 'built-in' | 'plugin' | 'sdk'
   tokens: number
 }
 
@@ -307,7 +307,7 @@ async function countSystemTokens(
           content.length > 0 && content !== SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
       )
       .map(content => ({ name: extractSectionName(content), content })),
-    ...Object.entries(systemContext)
+    ...(Object.entries(systemContext) as Array<[string, string]>)
       .filter(([, content]) => content.length > 0)
       .map(([name, content]) => ({ name, content })),
   ]
@@ -639,6 +639,7 @@ export async function countMcpToolTokens(
   agentInfo: AgentDefinitionsResult | null,
   model: string,
   messages?: Message[],
+  countToolDefinitionTokensForContext = countToolDefinitionTokens,
 ): Promise<{
   mcpToolTokens: number
   mcpToolDetails: McpTool[]
@@ -648,7 +649,7 @@ export async function countMcpToolTokens(
   const mcpTools = tools.filter(tool => tool.isMcp)
   const mcpToolDetails: McpTool[] = []
   // Single bulk API call for all MCP tools (instead of N individual calls)
-  const totalTokensRaw = await countToolDefinitionTokens(
+  const totalTokensRaw = await countToolDefinitionTokensForContext(
     mcpTools,
     getToolPermissionContext,
     agentInfo,

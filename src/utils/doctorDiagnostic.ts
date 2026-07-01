@@ -35,6 +35,10 @@ import { getPlatform } from './platform.js'
 import { getRipgrepStatus } from './ripgrep.js'
 import { SandboxManager } from './sandbox/sandbox-adapter.js'
 import { getManagedFilePath } from './settings/managedPath.js'
+import {
+  getRelativeSettingsFilePathForSource,
+  getSettingsRootPathForSource,
+} from './settings/settings.js'
 import { CUSTOMIZATION_SURFACES } from './settings/types.js'
 import {
   findClaudeAlias,
@@ -95,10 +99,6 @@ function getNormalizedPaths(): [invokedPath: string, execPath: string] {
 }
 
 export async function getCurrentInstallationType(): Promise<InstallationType> {
-  if (process.env.NODE_ENV === 'development') {
-    return 'development'
-  }
-
   const [invokedPath] = getNormalizedPaths()
 
   // Check if running in bundled mode first
@@ -152,6 +152,15 @@ export async function getCurrentInstallationType(): Promise<InstallationType> {
 
   if (globalPrefix && invokedPath.startsWith(globalPrefix)) {
     return 'npm-global'
+  }
+
+  // Development build: running from a source tree (e.g. `bun run dev`) with
+  // NODE_ENV=development. Checked AFTER all real-install path markers so that
+  // a user shell exporting NODE_ENV=development can't downgrade a real npm
+  // install to 'development' (which would block /update). A source-tree run
+  // matches none of the path markers above, so it lands here.
+  if (process.env.NODE_ENV === 'development') {
+    return 'development'
   }
 
   // If we can't determine, return unknown
@@ -336,10 +345,59 @@ async function detectMultipleInstallations(): Promise<
   return installations
 }
 
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await getFsImplementation().stat(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+export async function detectStaleProjectSettingsPaths(
+  cwd: string = getSettingsRootPathForSource('projectSettings'),
+): Promise<{ issue: string; fix: string } | null> {
+  const pairs = [
+    {
+      legacy: '.claude/settings.json',
+      canonical: getRelativeSettingsFilePathForSource('projectSettings'),
+    },
+    {
+      legacy: '.claude/settings.local.json',
+      canonical: getRelativeSettingsFilePathForSource('localSettings'),
+    },
+  ]
+
+  const stale: Array<{ legacy: string; canonical: string }> = []
+  for (const pair of pairs) {
+    const legacyExists = await pathExists(join(cwd, pair.legacy))
+    if (!legacyExists) continue
+    const canonicalExists = await pathExists(join(cwd, pair.canonical))
+    if (!canonicalExists) {
+      stale.push(pair)
+    }
+  }
+
+  if (stale.length === 0) return null
+
+  const legacyPaths = stale.map(pair => pair.legacy).join(', ')
+  const canonicalPaths = stale.map(pair => pair.canonical).join(', ')
+
+  return {
+    issue: `Legacy project settings file${stale.length === 1 ? '' : 's'} ${legacyPaths} found, but OpenClaude reads ${canonicalPaths}`,
+    fix: `Move or copy ${legacyPaths} to ${canonicalPaths} if you intended OpenClaude to use those project settings.`,
+  }
+}
+
 async function detectConfigurationIssues(
   type: InstallationType,
 ): Promise<Array<{ issue: string; fix: string }>> {
   const warnings: Array<{ issue: string; fix: string }> = []
+
+  const staleProjectSettingsWarning = await detectStaleProjectSettingsPaths()
+  if (staleProjectSettingsWarning) {
+    warnings.push(staleProjectSettingsWarning)
+  }
 
   // Managed-settings forwards-compat: the schema preprocess silently drops
   // unknown strictPluginOnlyCustomization surface names so one future enum

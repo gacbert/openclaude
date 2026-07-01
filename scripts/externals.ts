@@ -54,11 +54,11 @@ export const SDK_EXTERNALS: string[] = [...COMMON_EXTERNALS, ...SDK_ONLY_EXTERNA
 // Packages intentionally bundled (not external, not flagged by validation)
 // These are small utilities that are fine to inline into the output bundle.
 export const INTENTIONALLY_BUNDLED: string[] = [
+  // Test utilities (bundled, not external)
   // Anthropic provider variants (bundled, not the main SDK)
   '@anthropic-ai/bedrock-sdk',
   '@anthropic-ai/foundry-sdk',
   '@anthropic-ai/sandbox-runtime',
-  '@anthropic-ai/vertex-sdk',
   // CLI / TUI utilities
   '@alcalzone/ansi-tokenize',
   '@commander-js/extra-typings',
@@ -72,7 +72,6 @@ export const INTENTIONALLY_BUNDLED: string[] = [
   'figures',
   'get-east-asian-width',
   'indent-string',
-  'strip-ansi',
   'supports-hyperlinks',
   'wrap-ansi',
   // Data formats
@@ -97,8 +96,6 @@ export const INTENTIONALLY_BUNDLED: string[] = [
   'semver',
   'shell-quote',
   'signal-exit',
-  'stack-utils',
-  'code-excerpt',
   'type-fest',
   // Networking
   'axios',
@@ -123,8 +120,6 @@ export const INTENTIONALLY_BUNDLED: string[] = [
     // gRPC (bundled into CLI, not external)
   '@grpc/grpc-js',
   '@grpc/proto-loader',
-  // Web scraping
-  '@mendable/firecrawl-js',
   // Language server protocol
   'vscode-languageserver-protocol',
   // File watching

@@ -2,7 +2,7 @@ import { PassThrough } from 'node:stream'
 
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test'
 import React from 'react'
-import stripAnsi from 'strip-ansi'
+import { stripVTControlCharacters as stripAnsi } from 'node:util'
 
 import { createRoot } from '../ink.js'
 import { KeybindingSetup } from '../keybindings/KeybindingProviderSetup.js'
@@ -113,11 +113,14 @@ const PRESET_ORDER = [
   'Anthropic',
   'Alibaba Coding Plan (China)',
   'Alibaba Coding Plan',
+  'Atlas Cloud',
   'Azure OpenAI',
   'Bankr',
+  'ClinePass',
   'DeepSeek',
   'Codex OAuth',
   'xAI OAuth (Grok)',
+  'Fireworks AI',
   'Google Gemini',
   'Groq',
   'Hicap',
@@ -128,6 +131,7 @@ const PRESET_ORDER = [
   'Mistral AI',
   'Moonshot AI - API',
   'Moonshot AI - Kimi Code',
+  'NEAR AI',
   'NVIDIA NIM',
   'OpenAI',
   'OpenCode Go',
@@ -137,6 +141,7 @@ const PRESET_ORDER = [
   'Venice',
   'xAI',
   'Xiaomi MiMo',
+  'Xiaomi MiMo (Token Plan)',
   'Z.AI - GLM Coding Plan',
   'Custom',
 ] as const
@@ -248,7 +253,7 @@ function mockProviderProfilesModule(options?: {
           provider: 'hicap',
           name: 'Hicap',
           baseUrl: 'https://api.hicap.ai/v1',
-          model: 'claude-opus-4.7',
+          model: 'claude-opus-4.8',
           apiKey: '',
           requiresApiKey: true,
         }
@@ -997,7 +1002,7 @@ test('ProviderManager saves Hicap preset non-GPT model with Chat Completions', a
     )
 
     expect(modelOutput).toContain('Hicap')
-    expect(modelOutput).toContain('claude-opus-4.7')
+    expect(modelOutput).toContain('claude-opus-4.8')
 
     mounted.stdin.write('\r')
     await waitForFrameOutput(mounted.getOutput, frame =>
@@ -1011,7 +1016,7 @@ test('ProviderManager saves Hicap preset non-GPT model with Chat Completions', a
     expect(addProviderProfile).toHaveBeenCalledWith(
       expect.objectContaining({
         provider: 'hicap',
-        model: 'claude-opus-4.7',
+        model: 'claude-opus-4.8',
         apiFormat: 'chat_completions',
       }),
       expect.objectContaining({ makeActive: true }),

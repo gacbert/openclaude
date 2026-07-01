@@ -7,11 +7,14 @@ import type { CanUseToolFn } from './hooks/useCanUseTool.js'
 import { FallbackTriggeredError } from './services/api/withRetry.js'
 import {
   calculateTokenWarningState,
+  getAutoCompactThreshold,
   isAutoCompactEnabled,
   MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES,
   type AutoCompactTrackingState,
 } from './services/compact/autoCompact.js'
+import { consumeCompactionRequest } from './utils/memoryPressure.js'
 import { buildPostCompactMessages } from './services/compact/compact.js'
+import type { MicrocompactResult } from './services/compact/microCompact.js'
 /* eslint-disable @typescript-eslint/no-require-imports */
 const reactiveCompact = feature('REACTIVE_COMPACT')
   ? (require('./services/compact/reactiveCompact.js') as typeof import('./services/compact/reactiveCompact.js'))
@@ -40,11 +43,13 @@ import type {
 } from './types/message.js'
 import { logError } from './utils/log.js'
 import {
+  getProviderMaxTokensCapFromMessage,
   PROMPT_TOO_LONG_ERROR_MESSAGE,
   isPromptTooLongMessage,
 } from './services/api/errors.js'
 import { logAntError, logForDebugging } from './utils/debug.js'
 import {
+  createAssistantMessage,
   createUserMessage,
   createUserInterruptionMessage,
   normalizeMessagesForAPI,
@@ -99,14 +104,21 @@ import { StreamingToolExecutor } from './services/tools/StreamingToolExecutor.js
 import { queryCheckpoint } from './utils/queryProfiler.js'
 import { runTools } from './services/tools/toolOrchestration.js'
 import { applyToolResultBudget } from './utils/toolResultStorage.js'
+import { resolveNextFallbackProviderFromState } from './utils/providerFallback.js'
+import { setActiveProviderProfile } from './utils/providerProfiles.js'
+import { getPrimaryModel } from './utils/providerModels.js'
 import { recordContentReplacement } from './utils/sessionStorage.js'
 import { handleStopHooks } from './query/stopHooks.js'
 import {
   createToolFailureLoopGuardState,
   updateToolFailureLoopGuard,
 } from './query/toolFailureLoopGuard.js'
+import { AGENT_STEP_LIMIT_TOOL_RESULT_PREFIX } from './query/agentStepLimit.js'
 import { buildQueryConfig } from './query/config.js'
-import { getGlobalConfig } from './utils/config.js'
+import {
+  getGlobalConfig,
+  normalizeMaxMessagesCompactionThreshold,
+} from './utils/config.js'
 import { productionDeps, type QueryDeps } from './query/deps.js'
 import type { Terminal, Continue } from './query/transitions.js'
 import { feature } from 'bun:bundle'
@@ -168,7 +180,124 @@ function* yieldMissingToolResultBlocks(
  * rules, ye will be punished with an entire day of debugging and hair pulling.
  */
 const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
-const MAX_CONTINUATION_NUDGES = 3
+const MAX_CONTINUATION_NUDGES = 20
+
+type AgentStepLimitConfig = {
+  maxSteps: number
+  agentType?: string
+}
+
+type AgentStepLimitState = AgentStepLimitConfig & {
+  stepsUsed: number
+  summaryRequested: boolean
+}
+
+function normalizeAgentStepLimit(
+  limit: AgentStepLimitConfig | undefined,
+): AgentStepLimitState | undefined {
+  if (
+    !limit ||
+    !Number.isInteger(limit.maxSteps) ||
+    limit.maxSteps <= 0
+  ) {
+    return undefined
+  }
+  return {
+    maxSteps: limit.maxSteps,
+    agentType: limit.agentType,
+    stepsUsed: 0,
+    summaryRequested: false,
+  }
+}
+
+function findAssistantMessageForToolUse(
+  assistantMessages: AssistantMessage[],
+  toolUseId: string,
+): AssistantMessage | undefined {
+  return assistantMessages.find(message =>
+    message.message.content.some(
+      content => content.type === 'tool_use' && content.id === toolUseId,
+    ),
+  )
+}
+
+function createAgentStepLimitToolResult(
+  toolUse: ToolUseBlock,
+  assistantMessage: AssistantMessage | undefined,
+  limit: AgentStepLimitState,
+): UserMessage {
+  const content =
+    `${AGENT_STEP_LIMIT_TOOL_RESULT_PREFIX} for '${limit.agentType ?? 'subagent'}' ` +
+    `(${limit.stepsUsed}/${limit.maxSteps} tool uses). This tool call was not executed. ` +
+    'Do not call more tools; provide the final summary requested next.'
+
+  return createUserMessage({
+    content: [
+      {
+        type: 'tool_result',
+        content: `<tool_use_error>${content}</tool_use_error>`,
+        is_error: true,
+        tool_use_id: toolUse.id,
+      },
+    ],
+    toolUseResult: content,
+    isAgentStepLimitToolResult: true,
+    ...(assistantMessage
+      ? { sourceToolAssistantUUID: assistantMessage.uuid }
+      : {}),
+  })
+}
+
+function createAgentStepLimitSummaryRequest(
+  limit: AgentStepLimitState,
+): UserMessage {
+  return createUserMessage({
+    content:
+      `Agent '${limit.agentType ?? 'subagent'}' reached its configured step limit ` +
+      `after ${limit.stepsUsed}/${limit.maxSteps} tool uses. Stop using tools now. ` +
+      'Provide a concise final summary with these sections: completed work, findings, ' +
+      'remaining tasks, and whether another run is needed.',
+    isMeta: true,
+  })
+}
+
+function createAgentStepLimitForcedSummary(
+  limit: AgentStepLimitState,
+  blockedToolUseCount: number,
+): AssistantMessage {
+  const blockedCallText =
+    blockedToolUseCount === 1
+      ? '1 additional tool call was blocked'
+      : `${blockedToolUseCount} additional tool calls were blocked`
+
+  return createAssistantMessage({
+    content:
+      `Completed work: Agent '${limit.agentType ?? 'subagent'}' reached its configured step limit ` +
+      `after ${limit.stepsUsed}/${limit.maxSteps} tool uses. ` +
+      `Findings: ${blockedCallText} during the forced summary step and no more tools were run. ` +
+      'Remaining tasks: continue any unfinished work in another run if more tool access is needed. ' +
+      'Another run needed: yes, if the requested task is not complete.',
+  })
+}
+
+function hasAssistantSummaryText(
+  assistantMessage: AssistantMessage | undefined,
+): boolean {
+  const text = (assistantMessage?.message.content ?? [])
+    .map(part =>
+      part.type === 'text' && typeof part.text === 'string'
+        ? part.text.toLowerCase()
+        : '',
+    )
+    .join('\n')
+
+  return (
+    text.includes('completed') &&
+    text.includes('findings') &&
+    text.includes('remaining tasks') &&
+    text.includes('another run')
+  )
+}
 
 function formatAutoCompactRetryDelay(delayMs: number): string {
   const totalSeconds = Math.max(1, Math.ceil(delayMs / 1000))
@@ -194,6 +323,15 @@ function isWithheldMaxOutputTokens(
   return msg?.type === 'assistant' && msg.apiError === 'max_output_tokens'
 }
 
+function isWithheldProviderMaxTokensCap(
+  msg: Message | StreamEvent | undefined,
+): msg is AssistantMessage {
+  return (
+    msg?.type === 'assistant' &&
+    getProviderMaxTokensCapFromMessage(msg) !== undefined
+  )
+}
+
 export type QueryParams = {
   messages: Message[]
   systemPrompt: SystemPrompt
@@ -215,6 +353,7 @@ export type QueryParams = {
   // budget for the whole agentic turn; `remaining` is computed per iteration
   // from cumulative API usage. See configureTaskBudgetParams in claude.ts.
   taskBudget?: { total: number }
+  agentStepLimit?: AgentStepLimitConfig
   deps?: QueryDeps
 }
 
@@ -228,8 +367,14 @@ type State = {
   maxOutputTokensRecoveryCount: number
   hasAttemptedReactiveCompact: boolean
   maxOutputTokensOverride: number | undefined
+  providerMaxOutputTokensCap: number | undefined
   pendingToolUseSummary: Promise<ToolUseSummaryMessage | null> | undefined
   stopHookActive: boolean | undefined
+  // One-shot guard for the provider-fallback recovery branch (issue #768).
+  // Set when we swap active provider in response to a rate-limit assistant
+  // error, cleared at next_turn / continuation_nudge / token_budget_continuation
+  // so a fresh user turn can fall back again.
+  hasAttemptedProviderFallback: boolean
   turnCount: number
   // Count of consecutive continuation nudges within the current turn.
   // Capped at MAX_CONTINUATION_NUDGES to prevent infinite nudge loops
@@ -238,6 +383,7 @@ type State = {
   // Why the previous iteration continued. Undefined on first iteration.
   // Lets tests assert recovery paths fired without inspecting message contents.
   transition: Continue | undefined
+  agentStepLimit: AgentStepLimitState | undefined
 }
 
 export async function* query(
@@ -302,14 +448,17 @@ async function* queryLoop(
     messages: params.messages,
     toolUseContext: params.toolUseContext,
     maxOutputTokensOverride: params.maxOutputTokensOverride,
+    providerMaxOutputTokensCap: undefined,
     autoCompactTracking: params.autoCompactTracking,
     stopHookActive: undefined,
     maxOutputTokensRecoveryCount: 0,
     hasAttemptedReactiveCompact: false,
+    hasAttemptedProviderFallback: false,
     turnCount: 1,
     continuationNudgeCount: 0,
     pendingToolUseSummary: undefined,
     transition: undefined,
+    agentStepLimit: normalizeAgentStepLimit(params.agentStepLimit),
   }
   const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
 
@@ -355,11 +504,20 @@ async function* queryLoop(
       autoCompactTracking,
       maxOutputTokensRecoveryCount,
       hasAttemptedReactiveCompact,
+      hasAttemptedProviderFallback,
       maxOutputTokensOverride,
+      providerMaxOutputTokensCap,
       pendingToolUseSummary,
       stopHookActive,
       turnCount,
+      agentStepLimit,
     } = state
+    const effectiveMaxOutputTokensOverride =
+      maxOutputTokensOverride === undefined
+        ? providerMaxOutputTokensCap
+        : providerMaxOutputTokensCap === undefined
+          ? maxOutputTokensOverride
+          : Math.min(maxOutputTokensOverride, providerMaxOutputTokensCap)
 
     // Skill discovery prefetch — per-iteration (uses findWritePivot guard
     // that returns early on non-write iterations). Discovery runs while the
@@ -416,6 +574,12 @@ async function* queryLoop(
     }
 
     let tracking = autoCompactTracking
+    const configuredMaxMessagesCompactionThreshold =
+      getGlobalConfig().maxMessagesCompactionThreshold
+    const maxMessagesCompactionThreshold =
+      normalizeMaxMessagesCompactionThreshold(
+        configuredMaxMessagesCompactionThreshold,
+      )
 
     // Enforce per-message budget on aggregate tool result size. Runs BEFORE
     // microcompact — cached MC operates purely by tool_use_id (never inspects
@@ -468,17 +632,23 @@ async function* queryLoop(
 
     // Apply microcompact before autocompact
     queryCheckpoint('query_microcompact_start')
-    const microcompactResult = await deps.microcompact(
-      messagesForQuery,
-      toolUseContext,
-      querySource,
-    )
-    messagesForQuery = microcompactResult.messages
+    let microcompactResult: MicrocompactResult | undefined
+    if (
+      querySource === 'compact' ||
+      configuredMaxMessagesCompactionThreshold !== 'off'
+    ) {
+      microcompactResult = await deps.microcompact(
+        messagesForQuery,
+        toolUseContext,
+        querySource,
+      )
+      messagesForQuery = microcompactResult.messages
+    }
     // For cached microcompact (cache editing), defer boundary message until after
     // the API response so we can use actual cache_deleted_input_tokens.
     // Gated behind feature() so the string is eliminated from external builds.
     const pendingCacheEdits = feature('CACHED_MICROCOMPACT')
-      ? microcompactResult.compactionInfo?.pendingCacheEdits
+      ? microcompactResult?.compactionInfo?.pendingCacheEdits
       : undefined
     queryCheckpoint('query_microcompact_end')
 
@@ -525,6 +695,36 @@ async function* queryLoop(
     const fullSystemPrompt = asSystemPrompt(
       appendSystemContext(asSystemPrompt(promptWithArc), systemContext),
     )
+
+    // Force compaction if memory pressure detected or message count exceeded.
+    // Sets forceReason on tracking so autoCompactIfNeeded bypasses the
+    // token-threshold check. Consumed once (one-shot) inside autocompact.
+    // Skip for compact/session_memory sources — those run inside an existing
+    // compaction and forcing would deadlock via recursive autocompaction.
+    const canForceCompact =
+      querySource !== 'compact' && querySource !== 'session_memory'
+    if (canForceCompact) {
+      const configSetting = maxMessagesCompactionThreshold
+      const envSetting = process.env.OPENCLAUDE_MAX_ACTIVE_MESSAGES
+      const maxActiveMessages = configSetting !== 'off'
+        ? Number.parseInt(configSetting, 10)
+        : envSetting
+          ? Number.parseInt(envSetting, 10)
+          : 0
+
+      if (maxActiveMessages > 0 && messagesForQuery.length > maxActiveMessages) {
+        tracking = {
+          ...(tracking ?? { compacted: false, turnId: '', turnCounter: 0 }),
+          forceReason: 'message-count',
+        }
+      }
+      if (consumeCompactionRequest()) {
+        tracking = {
+          ...(tracking ?? { compacted: false, turnId: '', turnCounter: 0 }),
+          forceReason: tracking?.forceReason ?? 'memory-pressure',
+        }
+      }
+    }
 
     queryCheckpoint('query_autocompact_start')
     const {
@@ -660,7 +860,8 @@ async function* queryLoop(
     let needsFollowUp = false
 
     queryCheckpoint('query_setup_start')
-    const useStreamingToolExecution = config.gates.streamingToolExecution
+    const useStreamingToolExecution =
+      config.gates.streamingToolExecution && agentStepLimit === undefined
     let streamingToolExecutor = useStreamingToolExecution
       ? new StreamingToolExecutor(
           toolUseContext.options.tools,
@@ -712,10 +913,18 @@ async function* queryLoop(
     // API call and starve both recovery paths. The isAutoCompactEnabled()
     // conjunct preserves the user's explicit "no automatic anything"
     // config — if they set DISABLE_AUTO_COMPACT, they get the preempt.
+    // hasActiveReduction() (not mere enablement) means a turn where collapse
+    // could not reduce anything still hits the blocking preempt instead of
+    // sending an oversized request that only a real 413 could recover.
     let collapseOwnsIt = false
     if (feature('CONTEXT_COLLAPSE')) {
+      // Only the main thread that owns the reduction may skip the blocking
+      // preempt: the store is shared with in-process subagents (agent:*), and a
+      // subagent must still preempt its own oversized turn rather than defer to
+      // a reduction that does not apply to its messages.
       collapseOwnsIt =
-        (contextCollapse?.isContextCollapseEnabled() ?? false) &&
+        (contextCollapse?.isMainThreadSource(querySource) ?? false) &&
+        (contextCollapse?.hasActiveReduction() ?? false) &&
         isAutoCompactEnabled()
     }
     // Hoist media-recovery gate once per turn. Withholding (inside the
@@ -756,7 +965,9 @@ async function* queryLoop(
       tracking?.consecutiveFailures !== undefined &&
       tracking.consecutiveFailures >=
         MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES &&
-      isAutoCompactEnabled()
+      (isAutoCompactEnabled() ||
+        circuitBreakerActive === true ||
+        circuitBreakerTripped === true)
     ) {
       const model = toolUseContext.options.mainLoopModel
       const tokenUsage = tokenCountWithEstimation(messagesForQuery) - snipTokensFreed
@@ -764,7 +975,11 @@ async function* queryLoop(
         tokenUsage,
         model,
       )
-      if (isAboveAutoCompactThreshold) {
+      const isAboveBreakerThreshold =
+        isAboveAutoCompactThreshold ||
+        ((circuitBreakerActive === true || circuitBreakerTripped === true) &&
+          tokenUsage >= getAutoCompactThreshold(model))
+      if (isAboveBreakerThreshold) {
         const nowMs = Date.now()
         const retryDelayMs =
           tracking.nextRetryAtMs !== undefined
@@ -786,6 +1001,9 @@ async function* queryLoop(
     }
 
     let attemptWithFallback = true
+    const toolsForModel = agentStepLimit?.summaryRequested
+      ? []
+      : toolUseContext.options.tools
 
     queryCheckpoint('query_api_loop_start')
     try {
@@ -798,7 +1016,7 @@ async function* queryLoop(
             messages: prependUserContext(messagesForQuery, userContext),
             systemPrompt: fullSystemPrompt,
             thinkingConfig: toolUseContext.options.thinkingConfig,
-            tools: toolUseContext.options.tools,
+            tools: toolsForModel,
             signal: toolUseContext.abortController.signal,
             options: {
               async getToolPermissionContext() {
@@ -822,19 +1040,23 @@ async function* queryLoop(
                 toolUseContext.options.agentDefinitions.allowedAgentTypes,
               hasAppendSystemPrompt:
                 !!toolUseContext.options.appendSystemPrompt,
-              maxOutputTokensOverride,
+              maxOutputTokensOverride: effectiveMaxOutputTokensOverride,
               fetchOverride: dumpPromptsFetch,
               mcpTools: appState.mcp.tools,
               hasPendingMcpServers: appState.mcp.clients.some(
                 c => c.type === 'pending',
               ),
               queryTracking,
+              queryLifecycle: toolUseContext.queryLifecycle,
               effortValue: appState.effortValue,
               advisorModel: appState.advisorModel,
               skipCacheWrite,
               agentId: toolUseContext.agentId,
               addNotification: toolUseContext.addNotification,
               providerOverride: toolUseContext.options.providerOverride,
+              ...(toolsForModel !== toolUseContext.options.tools && {
+                messageNormalizationTools: toolUseContext.options.tools,
+              }),
               ...(params.taskBudget && {
                 taskBudget: {
                   total: params.taskBudget.total,
@@ -957,6 +1179,28 @@ async function* queryLoop(
               withheld = true
             }
             if (isWithheldMaxOutputTokens(message)) {
+              withheld = true
+            }
+            if (isWithheldProviderMaxTokensCap(message)) {
+              withheld = true
+            }
+            // Withhold rate-limit errors when a providerFallbackChain entry is
+            // still available, so SDK consumers that terminate on yielded
+            // errors don't see the original 429 before queryLoop has a chance
+            // to switch providers and retry (jatmn review on #1176). The
+            // recovery branch below mirrors the same querySource / one-shot
+            // guards. If no fallback resolves, the recovery branch falls
+            // through to the standard error-termination path which yields
+            // the original error so the user still sees it.
+            if (
+              !hasAttemptedProviderFallback &&
+              querySource !== 'compact' &&
+              querySource !== 'session_memory' &&
+              message.type === 'assistant' &&
+              message.isApiErrorMessage === true &&
+              message.error === 'rate_limit' &&
+              resolveNextFallbackProviderFromState() !== null
+            ) {
               withheld = true
             }
             if (!withheld) {
@@ -1121,8 +1365,8 @@ async function* queryLoop(
 
       // Surface the real error instead of a misleading "[Request interrupted
       // by user]" — this path is a model/runtime failure, not a user action.
-      // SDK consumers were seeing phantom interrupts on e.g. Node 18's missing
-      // Array.prototype.with(), masking the actual cause.
+      // SDK consumers were seeing phantom interrupts on unsupported runtimes
+      // with missing built-ins, masking the actual cause.
       yield createAssistantAPIErrorMessage({
         content: errorMessage,
       })
@@ -1238,11 +1482,14 @@ async function* queryLoop(
               autoCompactTracking: tracking,
               maxOutputTokensRecoveryCount,
               hasAttemptedReactiveCompact,
+              hasAttemptedProviderFallback,
               maxOutputTokensOverride: undefined,
+              providerMaxOutputTokensCap,
               pendingToolUseSummary: undefined,
               stopHookActive: undefined,
               turnCount,
               continuationNudgeCount: state.continuationNudgeCount,
+              agentStepLimit,
               transition: {
                 reason: 'collapse_drain_retry',
                 committed: drained.committed,
@@ -1293,11 +1540,14 @@ async function* queryLoop(
             autoCompactTracking: undefined,
             maxOutputTokensRecoveryCount,
             hasAttemptedReactiveCompact: true,
+            hasAttemptedProviderFallback,
             maxOutputTokensOverride: undefined,
+            providerMaxOutputTokensCap,
             pendingToolUseSummary: undefined,
             stopHookActive: undefined,
             turnCount,
             continuationNudgeCount: state.continuationNudgeCount,
+            agentStepLimit,
             transition: { reason: 'reactive_compact_retry' },
           }
           state = next
@@ -1321,6 +1571,57 @@ async function* queryLoop(
         return { reason: 'prompt_too_long' }
       }
 
+      if (isWithheldProviderMaxTokensCap(lastMessage)) {
+        const providerMaxTokensCap =
+          getProviderMaxTokensCapFromMessage(lastMessage)
+        const shouldRetryWithProviderCap =
+          providerMaxTokensCap !== undefined &&
+          state.transition?.reason !== 'provider_max_tokens_retry' &&
+          (effectiveMaxOutputTokensOverride === undefined ||
+            providerMaxTokensCap < effectiveMaxOutputTokensOverride)
+
+        if (shouldRetryWithProviderCap) {
+          const nextProviderMaxOutputTokensCap =
+            providerMaxOutputTokensCap === undefined
+              ? providerMaxTokensCap
+              : Math.min(providerMaxOutputTokensCap, providerMaxTokensCap)
+          logEvent('tengu_provider_max_tokens_cap_retry', {
+            cap: providerMaxTokensCap,
+            ...(effectiveMaxOutputTokensOverride !== undefined && {
+              previousMaxOutputTokensOverride:
+                effectiveMaxOutputTokensOverride,
+            }),
+          })
+          yield createSystemMessage(
+            `Provider maximum output tokens limit is ${providerMaxTokensCap.toLocaleString('en-US')}; retrying with that cap.`,
+            'warning',
+          )
+          const next: State = {
+            messages: messagesForQuery,
+            toolUseContext,
+            autoCompactTracking: tracking,
+            maxOutputTokensRecoveryCount,
+            hasAttemptedReactiveCompact,
+            hasAttemptedProviderFallback,
+            maxOutputTokensOverride,
+            providerMaxOutputTokensCap: nextProviderMaxOutputTokensCap,
+            pendingToolUseSummary: undefined,
+            stopHookActive: undefined,
+            turnCount,
+            continuationNudgeCount: state.continuationNudgeCount,
+            agentStepLimit,
+            transition: {
+              reason: 'provider_max_tokens_retry',
+              cap: providerMaxTokensCap,
+            },
+          }
+          state = next
+          continue
+        }
+
+        yield lastMessage
+      }
+
       // Check for max_output_tokens and inject recovery message. The error
       // was withheld from the stream above; only surface it if recovery
       // exhausts.
@@ -1337,7 +1638,7 @@ async function* queryLoop(
         )
         if (
           capEnabled &&
-          maxOutputTokensOverride === undefined &&
+          effectiveMaxOutputTokensOverride === undefined &&
           !process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
         ) {
           logEvent('tengu_max_tokens_escalate', {
@@ -1349,11 +1650,14 @@ async function* queryLoop(
             autoCompactTracking: tracking,
             maxOutputTokensRecoveryCount,
             hasAttemptedReactiveCompact,
+            hasAttemptedProviderFallback,
             maxOutputTokensOverride: ESCALATED_MAX_TOKENS,
+            providerMaxOutputTokensCap,
             pendingToolUseSummary: undefined,
             stopHookActive: undefined,
             turnCount,
             continuationNudgeCount: state.continuationNudgeCount,
+            agentStepLimit,
             transition: { reason: 'max_output_tokens_escalate' },
           }
           state = next
@@ -1378,11 +1682,14 @@ async function* queryLoop(
             autoCompactTracking: tracking,
             maxOutputTokensRecoveryCount: maxOutputTokensRecoveryCount + 1,
             hasAttemptedReactiveCompact,
+            hasAttemptedProviderFallback,
             maxOutputTokensOverride: undefined,
+            providerMaxOutputTokensCap,
             pendingToolUseSummary: undefined,
             stopHookActive: undefined,
             turnCount,
             continuationNudgeCount: state.continuationNudgeCount,
+            agentStepLimit,
             transition: {
               reason: 'max_output_tokens_recovery',
               attempt: maxOutputTokensRecoveryCount + 1,
@@ -1393,6 +1700,87 @@ async function* queryLoop(
         }
 
         // Recovery exhausted — surface the withheld error now.
+        yield lastMessage
+      }
+
+      // Provider-fallback recovery (#768). When the active provider returns
+      // a rate-limit error and the user has configured an ordered
+      // `providerFallbackChain`, swap to the next chain entry and retry the
+      // turn once instead of bubbling the error to the UI. Skip for
+      // compact / session_memory fork queries — those are forked workers
+      // operating on the original conversation's tail; switching the active
+      // provider mid-fork would change the credentials the outer turn just
+      // committed to. Mirrors the pre-flight blocking-limit guard at
+      // ~query.ts:691.
+      const isWithheldRateLimit =
+        !hasAttemptedProviderFallback &&
+        querySource !== 'compact' &&
+        querySource !== 'session_memory' &&
+        lastMessage?.type === 'assistant' &&
+        lastMessage.isApiErrorMessage === true &&
+        lastMessage.error === 'rate_limit'
+      if (isWithheldRateLimit) {
+        const fallback = resolveNextFallbackProviderFromState()
+        if (fallback !== null) {
+          const activated = setActiveProviderProfile(fallback.nextProfileId)
+          if (activated) {
+            const fromLabel = fallback.fromProfileId ?? 'previous provider'
+            // Update the in-session model to the activated profile's primary
+            // model so the retry doesn't keep sending the rate-limited
+            // provider's model id against the new endpoint. Without this, the
+            // outer loop re-derives `currentModel` from
+            // `appState.mainLoopModelForSession ?? appState.mainLoopModel`,
+            // which still holds the previous provider's model (e.g. a Claude
+            // id), and `resolveProviderRequest` lets that explicit
+            // `options.model` win over the new profile's OPENAI_MODEL. Mirror
+            // the model_fallback branch above which updates both
+            // `toolUseContext.options.mainLoopModel` and the in-session app
+            // state.
+            const activatedModel = getPrimaryModel(activated.model)
+            if (activatedModel) {
+              toolUseContext.setAppState(prev => ({
+                ...prev,
+                mainLoopModel: activatedModel,
+                mainLoopModelForSession: null,
+              }))
+              toolUseContext.options.mainLoopModel = activatedModel
+            }
+            // System informational, NOT an assistant API error. The original
+            // 429 is still withheld upstream, so SDK hosts that terminate on
+            // `error: 'rate_limit'` assistant messages don't see one for this
+            // retry path — they only get the final tagged message if the
+            // entire fallback chain is exhausted (handled by `yield
+            // lastMessage` below). Mirrors the existing model-fallback notice
+            // at the model_fallback recovery branch.
+            yield createSystemMessage(
+              `Provider ${fromLabel} rate-limited — switched to ${activated.name}. Retrying turn.`,
+              'warning',
+            )
+            const next: State = {
+              messages: messagesForQuery,
+              toolUseContext,
+              autoCompactTracking: tracking,
+              maxOutputTokensRecoveryCount,
+              hasAttemptedReactiveCompact,
+              hasAttemptedProviderFallback: true,
+              maxOutputTokensOverride: undefined,
+              providerMaxOutputTokensCap: undefined,
+              pendingToolUseSummary: undefined,
+              stopHookActive: undefined,
+              turnCount,
+              continuationNudgeCount: state.continuationNudgeCount,
+              agentStepLimit,
+              transition: { reason: 'provider_fallback_retry' },
+            }
+            state = next
+            continue
+          }
+        }
+        // No fallback configured / chain exhausted / activation failed — yield
+        // the original rate-limit message now (the streaming withhold gate
+        // suppressed it so SDK consumers wouldn't see it before we knew a
+        // fallback was possible) and fall through to the standard API-error
+        // termination below.
         yield lastMessage
       }
 
@@ -1414,6 +1802,8 @@ async function* queryLoop(
         toolUseContext,
         querySource,
         stopHookActive,
+        deps.goalEvaluationDeps,
+        deps.stopHookExecutionDeps,
       )
 
       if (stopHookResult.preventContinuation) {
@@ -1436,11 +1826,17 @@ async function* queryLoop(
           // here caused an infinite loop: compact → still too long → error →
           // stop hook blocking → compact → … burning thousands of API calls.
           hasAttemptedReactiveCompact,
+          // Same logic for the provider-fallback guard — a stop-hook blocking
+          // error after a fallback switch is unrelated to which provider is
+          // active, so preserve rather than re-fall-back.
+          hasAttemptedProviderFallback,
           maxOutputTokensOverride: undefined,
+          providerMaxOutputTokensCap,
           pendingToolUseSummary: undefined,
-          stopHookActive: true,
+          stopHookActive: stopHookResult.stopHookActive,
           turnCount,
           continuationNudgeCount: state.continuationNudgeCount,
+          agentStepLimit,
           transition: { reason: 'stop_hook_blocking' },
         }
         state = next
@@ -1473,11 +1869,14 @@ async function* queryLoop(
             autoCompactTracking: tracking,
             maxOutputTokensRecoveryCount: 0,
             hasAttemptedReactiveCompact: false,
+            hasAttemptedProviderFallback: false,
             maxOutputTokensOverride: undefined,
+            providerMaxOutputTokensCap,
             pendingToolUseSummary: undefined,
             stopHookActive: undefined,
             turnCount,
             continuationNudgeCount: state.continuationNudgeCount,
+            agentStepLimit,
             transition: { reason: 'token_budget_continuation' },
           }
           continue
@@ -1505,13 +1904,17 @@ async function* queryLoop(
       // when the model keeps matching signals without ever calling tools.
       if (
         assistantMessages.length > 0 &&
+        !agentStepLimit?.summaryRequested &&
         turnCount < (maxTurns ?? Infinity) &&
         state.continuationNudgeCount < MAX_CONTINUATION_NUDGES
       ) {
         const lastAssistant = assistantMessages.at(-1)
         if (lastAssistant?.type === 'assistant') {
           const lastText = lastAssistant.message.content
-            .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+            .filter(
+              (b): b is Extract<typeof b, { type: 'text' }> =>
+                b.type === 'text',
+            )
             .map(b => b.text)
             .join(' ')
             .toLowerCase()
@@ -1535,16 +1938,28 @@ async function* queryLoop(
               autoCompactTracking: tracking,
               maxOutputTokensRecoveryCount: 0,
               hasAttemptedReactiveCompact: false,
+              hasAttemptedProviderFallback: false,
               maxOutputTokensOverride: undefined,
+              providerMaxOutputTokensCap,
               pendingToolUseSummary: undefined,
               stopHookActive: undefined,
               turnCount,
               continuationNudgeCount: state.continuationNudgeCount + 1,
+              agentStepLimit,
               transition: { reason: 'continuation_nudge' },
             }
             state = next
             continue
           }
+        }
+      }
+
+      if (agentStepLimit?.summaryRequested) {
+        return {
+          reason: 'agent_step_limit',
+          turnCount,
+          stepsUsed: agentStepLimit.stepsUsed,
+          maxSteps: agentStepLimit.maxSteps,
         }
       }
 
@@ -1556,6 +1971,38 @@ async function* queryLoop(
 
     queryCheckpoint('query_tool_execution_start')
 
+    let toolUseBlocksToExecute = toolUseBlocks
+    let blockedToolUseBlocks: ToolUseBlock[] = []
+    let nextAgentStepLimit = agentStepLimit
+    let shouldRequestAgentStepSummary = false
+    const shouldTerminateAgentStepSummary =
+      agentStepLimit?.summaryRequested === true && toolUseBlocks.length > 0
+
+    if (agentStepLimit) {
+      if (agentStepLimit.summaryRequested) {
+        toolUseBlocksToExecute = []
+        blockedToolUseBlocks = toolUseBlocks
+      } else {
+        const remainingSteps = Math.max(
+          0,
+          agentStepLimit.maxSteps - agentStepLimit.stepsUsed,
+        )
+        toolUseBlocksToExecute = toolUseBlocks.slice(0, remainingSteps)
+        blockedToolUseBlocks = toolUseBlocks.slice(remainingSteps)
+        const stepsUsed =
+          agentStepLimit.stepsUsed + toolUseBlocksToExecute.length
+        const summaryRequested =
+          stepsUsed >= agentStepLimit.maxSteps ||
+          blockedToolUseBlocks.length > 0
+
+        nextAgentStepLimit = {
+          ...agentStepLimit,
+          stepsUsed,
+          summaryRequested,
+        }
+        shouldRequestAgentStepSummary = summaryRequested
+      }
+    }
 
     if (streamingToolExecutor) {
       logEvent('tengu_streaming_tool_execution_used', {
@@ -1573,7 +2020,12 @@ async function* queryLoop(
 
     const toolUpdates = streamingToolExecutor
       ? streamingToolExecutor.getRemainingResults()
-      : runTools(toolUseBlocks, assistantMessages, canUseTool, toolUseContext)
+      : runTools(
+          toolUseBlocksToExecute,
+          assistantMessages,
+          canUseTool,
+          toolUseContext,
+        )
 
     for await (const update of toolUpdates) {
       if (update.message) {
@@ -1600,6 +2052,34 @@ async function* queryLoop(
         }
       }
     }
+
+    if (nextAgentStepLimit && blockedToolUseBlocks.length > 0) {
+      for (const toolUse of blockedToolUseBlocks) {
+        const message = createAgentStepLimitToolResult(
+          toolUse,
+          findAssistantMessageForToolUse(assistantMessages, toolUse.id),
+          nextAgentStepLimit,
+        )
+        yield message
+        toolResults.push(message)
+      }
+    }
+
+    if (shouldTerminateAgentStepSummary && nextAgentStepLimit) {
+      if (!hasAssistantSummaryText(assistantMessages.at(-1))) {
+        yield createAgentStepLimitForcedSummary(
+          nextAgentStepLimit,
+          blockedToolUseBlocks.length,
+        )
+      }
+      return {
+        reason: 'agent_step_limit',
+        turnCount,
+        stepsUsed: nextAgentStepLimit.stepsUsed,
+        maxSteps: nextAgentStepLimit.maxSteps,
+      }
+    }
+
     queryCheckpoint('query_tool_execution_end')
 
     // Track multi-turn context after tool execution
@@ -1610,7 +2090,9 @@ async function* queryLoop(
       const { addMessageToTurn, addToolCallToTurn } = await import(
         './utils/multiTurnContext.js'
       )
-      addMessageToTurn(assistantMessage)
+      for (const assistantMessage of assistantMessages) {
+        addMessageToTurn(assistantMessage)
+      }
       for (const toolUse of toolUseBlocks) {
         addToolCallToTurn({
           id: toolUse.id,
@@ -1629,7 +2111,7 @@ async function* queryLoop(
       const { updateArcPhase, finalizeArcTurn } = await import(
         './utils/conversationArc.js'
       )
-      await updateArcPhase([assistantMessage])
+      await updateArcPhase(assistantMessages)
       await finalizeArcTurn()
     }
 
@@ -1700,6 +2182,24 @@ async function* queryLoop(
         content: toolFailureLoopDecision.message,
       })
       return { reason: 'tool_failure_loop' }
+    }
+
+    if (shouldRequestAgentStepSummary && nextAgentStepLimit) {
+      const summaryRequest =
+        createAgentStepLimitSummaryRequest(nextAgentStepLimit)
+      yield summaryRequest
+      toolResults.push(summaryRequest)
+      logForDebugging(
+        `[Agent: ${nextAgentStepLimit.agentType ?? 'subagent'}] Reached maxSteps limit (${nextAgentStepLimit.stepsUsed}/${nextAgentStepLimit.maxSteps}); requesting final summary`,
+      )
+      logEvent('tengu_agent_step_limit_reached', {
+        agent_type:
+          (nextAgentStepLimit.agentType ??
+            'subagent') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        steps_used: nextAgentStepLimit.stepsUsed,
+        max_steps: nextAgentStepLimit.maxSteps,
+        blocked_tool_uses: blockedToolUseBlocks.length,
+      })
     }
 
     // Generate tool use summary after tool batch completes — passed to next recursive call
@@ -1961,7 +2461,11 @@ async function* queryLoop(
     }
 
     // Check if we've reached the max turns limit
-    if (maxTurns && nextTurnCount > maxTurns) {
+    if (
+      maxTurns &&
+      nextTurnCount > maxTurns &&
+      !nextAgentStepLimit?.summaryRequested
+    ) {
       yield createAttachmentMessage({
         type: 'max_turns_reached',
         maxTurns,
@@ -1979,10 +2483,13 @@ async function* queryLoop(
       turnCount: nextTurnCount,
       maxOutputTokensRecoveryCount: 0,
       hasAttemptedReactiveCompact: false,
+      hasAttemptedProviderFallback: false,
       continuationNudgeCount: 0,
       pendingToolUseSummary: nextPendingToolUseSummary,
       maxOutputTokensOverride: undefined,
+      providerMaxOutputTokensCap,
       stopHookActive,
+      agentStepLimit: nextAgentStepLimit,
       transition: { reason: 'next_turn' },
     }
     state = next

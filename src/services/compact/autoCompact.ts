@@ -68,6 +68,10 @@ export type AutoCompactTrackingState = {
   // threaded through query() callers rather than serialized into transcripts.
   nextRetryAtMs?: number
   lastFailureAtMs?: number
+  // When set, bypasses shouldAutoCompact() token threshold check.
+  // Used by memory pressure and message count guards to force compaction
+  // even when token usage is below the normal autocompact threshold.
+  forceReason?: 'memory-pressure' | 'message-count'
 }
 
 export const AUTOCOMPACT_BUFFER_TOKENS = 13_000
@@ -76,6 +80,11 @@ export const ERROR_THRESHOLD_BUFFER_TOKENS = 20_000
 export const MANUAL_COMPACT_BUFFER_TOKENS = 3_000
 
 export const AUTOCOMPACT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000
+
+// Minimum cooldown override allowed via OPENCLAUDE_AUTOCOMPACT_FAILURE_COOLDOWN_MS.
+// Values below this floor are rejected (function falls back to the default) so
+// misconfiguration cannot effectively disable the circuit breaker.
+export const MIN_AUTOCOMPACT_FAILURE_COOLDOWN_MS = 10_000
 
 // Pause autocompact after this many consecutive failures.
 // BQ 2026-03-10: 1,279 sessions had 50+ consecutive failures (up to 3,272)
@@ -87,7 +96,11 @@ export function getAutoCompactFailureCooldownMs(): number {
   if (override) {
     const trimmed = override.trim()
     const parsed = Number(trimmed)
-    if (/^[1-9]\d*$/.test(trimmed) && Number.isSafeInteger(parsed)) {
+    if (
+      /^[1-9]\d*$/.test(trimmed) &&
+      Number.isSafeInteger(parsed) &&
+      parsed >= MIN_AUTOCOMPACT_FAILURE_COOLDOWN_MS
+    ) {
       return parsed
     }
   }
@@ -255,6 +268,10 @@ export async function shouldAutoCompact(
   // pre-snip context, so tokenCountWithEstimation can't see the savings.
   // Subtract the rough-delta that snip already computed.
   snipTokensFreed = 0,
+  // When true, skip the token-threshold check but still run all guards
+  // (recursion, disabled, reactive-only, context-collapse). Used by
+  // forceReason to bypass only the token gate, not the safety guards.
+  skipTokenCheck = false,
 ): Promise<boolean> {
   // Recursion guards. session_memory and compact are forked agents that
   // would deadlock.
@@ -298,18 +315,29 @@ export async function shouldAutoCompact(
   // fallback (it consults isAutoCompactEnabled directly) and leaves
   // sessionMemory + manual /compact working.
   //
-  // Consult isContextCollapseEnabled (not the raw gate) so the
-  // CLAUDE_CONTEXT_COLLAPSE env override is honored here too. require()
-  // inside the block breaks the init-time cycle (this file exports
+  // hasActiveReduction() folds in the enablement check (so the
+  // CLAUDE_CONTEXT_COLLAPSE env override is honored here too) but also
+  // requires collapse to actually hold a committed/staged reduction.
+  // require() inside the block breaks the init-time cycle (this file exports
   // getEffectiveContextWindowSize which collapse's index imports).
   if (feature('CONTEXT_COLLAPSE')) {
     /* eslint-disable @typescript-eslint/no-require-imports */
-    const { isContextCollapseEnabled } =
+    const { hasActiveReduction, isMainThreadSource } =
       require('../contextCollapse/index.js') as typeof import('../contextCollapse/index.js')
     /* eslint-enable @typescript-eslint/no-require-imports */
-    if (isContextCollapseEnabled()) {
+    // Suppress only when collapse actually holds the headroom (a committed or
+    // staged reduction) AND this is the main thread that owns it. The store is
+    // shared across in-process subagents (agent:*); a subagent must still
+    // autocompact its own oversized transcript instead of being suppressed by a
+    // reduction that only applies to the main transcript.
+    if (isMainThreadSource(querySource) && hasActiveReduction()) {
       return false
     }
+  }
+
+  if (skipTokenCheck) {
+    logForDebugging('autocompact: skipping token threshold check (forced)')
+    return true
   }
 
   const tokenCount = tokenCountWithEstimation(messages) - snipTokensFreed
@@ -349,11 +377,20 @@ export async function autoCompactIfNeeded(
   }
 
   const model = toolUseContext.options.mainLoopModel
+  // Force compaction if a pressure/count signal set forceReason.
+  // Consume the flag so it only forces one compaction cycle.
+  // Pass skipTokenCheck to shouldAutoCompact so safety guards
+  // (disabled, reactive-only, context-collapse, recursion) still apply.
+  const forcedBy = tracking?.forceReason
+  if (tracking?.forceReason) {
+    tracking.forceReason = undefined
+  }
   const shouldCompact = await shouldAutoCompact(
     messages,
     model,
     querySource,
     snipTokensFreed,
+    !!forcedBy,
   )
 
   if (!shouldCompact) {

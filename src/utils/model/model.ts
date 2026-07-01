@@ -29,6 +29,7 @@ import { isModelAllowed } from './modelAllowlist.js'
 import { type ModelAlias, isModelAlias } from './aliases.js'
 import { capitalize } from '../stringUtils.js'
 import { DEFAULT_GEMINI_MODEL } from '../providerProfile.js'
+import { getAntModelOverrideConfig, resolveAntModel } from './antModels.js'
 
 export type ModelShortName = string
 export type ModelName = string
@@ -81,9 +82,9 @@ export function getSmallFastModel(): ModelName {
   if (getAPIProvider() === 'xiaomi-mimo') {
     return process.env.OPENAI_MODEL || 'mimo-v2-flash'
   }
-  // xAI — OPENAI_MODEL carries the active Grok model; fall back to grok-3.
+  // xAI — OPENAI_MODEL carries the active Grok model; fall back to Grok 4.3.
   if (getAPIProvider() === 'xai') {
-    return process.env.OPENAI_MODEL || 'grok-3'
+    return process.env.OPENAI_MODEL || 'grok-4.3'
   }
   return getDefaultHaikuModel()
 }
@@ -223,9 +224,9 @@ export function getDefaultOpusModel(): ModelName {
   }
   // 3P providers (Bedrock, Vertex, Foundry) — kept as a separate branch
   // since 3P availability lags firstParty and these will diverge again at
-  // the next model launch. Keep 3P on Opus 4.6 until they roll out 4.7.
+  // the next model launch. Keep 3P on Opus 4.7 until they roll out 4.8.
   if (getAPIProvider() !== 'firstParty') {
-    return getModelStrings().opus46
+    return getModelStrings().opus47
   }
   return getModelStrings().opus48
 }
@@ -315,9 +316,9 @@ export function getDefaultHaikuModel(): ModelName {
   if (getAPIProvider() === 'xiaomi-mimo') {
     return process.env.OPENAI_MODEL || 'mimo-v2-flash'
   }
-  // xAI — faster Grok model for "haiku"-equivalent.
+  // xAI — use the current Grok default for "haiku"-equivalent until xAI exposes a smaller live alias.
   if (getAPIProvider() === 'xai') {
-    return process.env.OPENAI_MODEL || 'grok-3'
+    return process.env.OPENAI_MODEL || 'grok-4.3'
   }
 
   // Haiku 4.5 is available on all platforms (first-party, Foundry, Bedrock, Vertex)
@@ -391,9 +392,12 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
   if (getAPIProvider() === 'xai') {
     return process.env.OPENAI_MODEL || 'grok-4.3'
   }
-  // MiniMax provider: always use the configured MiniMax model
+  // MiniMax provider: always use the configured MiniMax model.
+  // Keep the env-only fallback aligned with the MiniMax descriptor default
+  // (MiniMax-M3) so a session with only MINIMAX_API_KEY / a MiniMax base URL
+  // defaults to the same model as --provider minimax and saved profiles.
   if (getAPIProvider() === 'minimax') {
-    return getMiniMaxModelEnv() || 'MiniMax-M2.7'
+    return getMiniMaxModelEnv() || 'MiniMax-M3'
   }
   // Xiaomi MiMo provider: always use the configured MiMo model
   if (getAPIProvider() === 'xiaomi-mimo') {
@@ -529,7 +533,7 @@ export function renderDefaultModelSetting(
   setting: ModelName | ModelAlias,
 ): string {
   if (setting === 'opusplan') {
-    return 'Opus 4.7 in plan mode, else Sonnet 4.6'
+    return 'Opus 4.8 in plan mode, else Sonnet 4.6'
   }
   return renderModelName(parseUserSpecifiedModel(setting))
 }
@@ -619,7 +623,11 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
       'gemini-3.1-pro-preview': 'Gemini 3.1 Pro Preview',
       'gemini-3-flash-preview': 'Gemini 3 Flash',
       'gemini-2.5-pro': 'Gemini 2.5 Pro',
-      'grok-code-fast-1': 'Grok Code Fast 1',
+      'grok-code-fast-1': 'Grok Build 0.1',
+      'grok-build-0.1': 'Grok Build 0.1',
+      'grok-4.20': 'Grok 4.20 Reasoning',
+      'grok-4.20-0309-reasoning': 'Grok 4.20 Reasoning',
+      'grok-4.20-0309-non-reasoning': 'Grok 4.20 Non-Reasoning',
     }
     if (copilotModelNames[model]) {
       return copilotModelNames[model]
@@ -764,17 +772,21 @@ export function parseUserSpecifiedModel(
       case 'opus':
         return getDefaultOpusModel() + (has1mTag ? '[1m]' : '')
       case 'best':
-        return getBestModel()
+        return getBestModel() + (has1mTag ? '[1m]' : '')
       default:
     }
   }
 
-  // Handle Codex aliases - map to actual model names
+  // Handle Codex aliases - map to actual model names. Preserve the [1m] tag the
+  // same way the Claude aliases above do: it is an explicit client-side opt-in
+  // to the 1M context window (see has1mContext), so dropping it here would
+  // silently shrink a `codexplan[1m]`/`codexspark[1m]` session back to the
+  // model default.
   if (modelString === 'codexplan') {
-    return 'gpt-5.5'
+    return 'gpt-5.5' + (has1mTag ? '[1m]' : '')
   }
   if (modelString === 'codexspark') {
-    return 'gpt-5.3-codex-spark'
+    return 'gpt-5.3-codex-spark' + (has1mTag ? '[1m]' : '')
   }
 
   // Opus 4/4.1 are no longer available on the first-party API (same as

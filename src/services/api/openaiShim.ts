@@ -11,6 +11,7 @@
  * Environment variables:
  *   CLAUDE_CODE_USE_OPENAI=1          — enable this provider
  *   OPENAI_API_KEY=sk-...             — API key (optional for local models)
+ *   OPENAI_API_KEYS=sk-a,sk-b         — optional comma-separated key pool for rotation
  *   OPENAI_AUTH_HEADER=api-key        — optional custom auth header name
  *   OPENAI_AUTH_HEADER_VALUE=...      — optional custom auth header value
  *   OPENAI_AUTH_SCHEME=bearer|raw     — auth scheme for Authorization/custom header handling
@@ -23,6 +24,11 @@
  *   CLAUDE_CODE_USE_GITHUB=1         — enable GitHub inference (no need for USE_OPENAI)
  *   GITHUB_TOKEN or GH_TOKEN         — Copilot API token (mapped to Bearer auth)
  *   OPENAI_MODEL                     — optional; use github:copilot or openai/gpt-4.1 style IDs
+ *
+ * Azure OpenAI / Microsoft Foundry (OpenAI-compatible chat):
+ *   AZURE_OPENAI_API_VERSION         — query param for chat/completions (default: 2024-12-01-preview)
+ *   OPENAI_AZURE_STYLE=1             — force Azure deployment URL + api-key header when the hostname
+ *                                     would not otherwise match (for example inference.ml.azure.com)
  */
 
 import { APIError } from '@anthropic-ai/sdk'
@@ -32,9 +38,16 @@ import {
 } from '../../utils/codexCredentials.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isBareMode, isEnvTruthy } from '../../utils/envUtils.js'
+import {
+  resolveModelReasoningControl,
+  resolveOpenAIShimReasoningRequestPlan,
+} from '../../utils/effort.js'
 import { resolveGeminiCredential } from '../../utils/geminiAuth.js'
 import { hydrateGeminiAccessTokenFromSecureStorage } from '../../utils/geminiCredentials.js'
-import { hydrateGithubModelsTokenFromSecureStorage } from '../../utils/githubModelsCredentials.js'
+import {
+  hydrateGithubModelsTokenFromSecureStorage,
+  refreshCopilotTokenOn401,
+} from '../../utils/githubModelsCredentials.js'
 import { resolveXaiAccessToken } from '../../utils/xaiCredentials.js'
 import { resolveOpenAIShimRuntimeContext } from '../../integrations/runtimeMetadata.js'
 import {
@@ -64,6 +77,8 @@ import {
   getLocalFastPathConfig,
   getLocalProviderRetryBaseUrls,
   getGithubEndpointType,
+  isDirectLocalOllamaEndpoint,
+  isLikelyOllamaEndpoint,
   isLocalProviderUrl,
   resolveRuntimeCodexCredentials,
   resolveProviderRequest,
@@ -76,7 +91,7 @@ import {
   classifyOpenAINetworkFailure,
 } from './openaiErrorClassification.js'
 import { sanitizeSchemaForOpenAICompat } from '../../utils/schemaSanitizer.js'
-import { redactSecretValueForDisplay } from '../../utils/providerProfile.js'
+import { redactSecretValueForDisplay, type SecretValueSource } from '../../utils/providerProfile.js'
 import { shouldRedactUrlQueryParam } from '../../utils/urlRedaction.js'
 import {
   normalizeToolArguments,
@@ -89,26 +104,29 @@ import {
   getStreamStats,
 } from '../../utils/streamingOptimizer.js'
 import { stableStringifyJson } from '../../utils/stableStringify.js'
-
-type SecretValueSource = Partial<{
-  OPENAI_API_KEY: string
-  OPENAI_AUTH_HEADER_VALUE: string
-  CODEX_API_KEY: string
-  GEMINI_API_KEY: string
-  GOOGLE_API_KEY: string
-  GEMINI_ACCESS_TOKEN: string
-  MISTRAL_API_KEY: string
-}>
+import {
+  CredentialPool,
+  type CredentialLease,
+  hasInvalidCredentialPlaceholder,
+  parseCredentialList,
+} from './credentialPool.js'
+import { MIN_RECOMMENDED_OLLAMA_CONTEXT_TOKENS } from '../../utils/ollamaContext.js'
 
 const GITHUB_429_MAX_RETRIES = 3
 const GITHUB_429_BASE_DELAY_SEC = 1
 const GITHUB_429_MAX_DELAY_SEC = 32
+const CREDENTIAL_POOL_COOLDOWN_MS = 30_000
 const GEMINI_API_HOST = 'generativelanguage.googleapis.com'
 const COPILOT_HEADERS: Record<string, string> = {
   'User-Agent': 'GitHubCopilotChat/0.26.7',
   'Editor-Version': 'vscode/1.99.3',
   'Editor-Plugin-Version': 'copilot-chat/0.26.7',
   'Copilot-Integration-Id': 'vscode-chat',
+}
+
+function isCopilotTokenExpiredError(text: string): boolean {
+  const lower = text.toLowerCase()
+  return lower.includes('token expired') || lower.includes('token has expired')
 }
 
 function isGithubModelsMode(): boolean {
@@ -205,12 +223,6 @@ function hasCerebrasApiHost(baseUrl: string | undefined): boolean {
   }
 }
 
-function normalizeDeepSeekReasoningEffort(
-  effort: 'low' | 'medium' | 'high' | 'xhigh',
-): 'high' | 'max' {
-  return effort === 'xhigh' ? 'max' : 'high'
-}
-
 function formatRetryAfterHint(response: Response): string {
   const ra = response.headers.get('retry-after')
   return ra ? ` (Retry-After: ${ra})` : ''
@@ -257,7 +269,7 @@ function sleepMs(ms: number): Promise<void> {
 
 interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
-  content?: string | Array<{ type: string; text?: string; image_url?: { url: string } }>
+  content?: string | OpenAIContentPart[]
   tool_calls?: Array<{
     id: string
     type: 'function'
@@ -276,6 +288,10 @@ interface OpenAIMessage {
   reasoning_content?: string
 }
 
+type OpenAIContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+
 interface OpenAITool {
   type: 'function'
   function: {
@@ -284,6 +300,399 @@ interface OpenAITool {
     parameters: Record<string, unknown>
     strict?: boolean
   }
+}
+
+type OllamaChatResponse = {
+  model?: string
+  message?: {
+    role?: string
+    content?: string
+    tool_calls?: Array<{
+      function?: {
+        name?: string
+        arguments?: unknown
+      }
+    }>
+  }
+  done?: boolean
+  done_reason?: string
+  prompt_eval_count?: number
+  eval_count?: number
+}
+
+type OllamaChatMessage = Omit<OpenAIMessage, 'content' | 'tool_calls'> & {
+  content?: string
+  images?: string[]
+  tool_calls?: Array<{
+    function: {
+      name: string
+      arguments: Record<string, unknown>
+    }
+  }>
+}
+
+function parsePositiveIntegerEnv(value: string | undefined): number | null {
+  if (!value?.trim()) {
+    return null
+  }
+  const parsed = Number(value.trim())
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null
+  }
+  return parsed
+}
+
+function getOllamaNumCtx(): number {
+  return (
+    parsePositiveIntegerEnv(process.env.OPENCLAUDE_OLLAMA_NUM_CTX) ??
+    parsePositiveIntegerEnv(process.env.OLLAMA_CONTEXT_LENGTH) ??
+    MIN_RECOMMENDED_OLLAMA_CONTEXT_TOKENS
+  )
+}
+
+function buildOllamaChatUrl(baseUrl: string): string {
+  const parsed = new URL(baseUrl)
+  parsed.pathname = parsed.pathname.replace(/\/+$/, '').replace(/\/v1$/i, '')
+  parsed.pathname = `${parsed.pathname.replace(/\/+$/, '')}/api/chat`
+  parsed.search = ''
+  parsed.hash = ''
+  return parsed.toString()
+}
+
+function extractOllamaImageData(url: string): string | null {
+  const match = url.match(/^data:[^;,]+;base64,(.+)$/i)
+  if (!match) {
+    return null
+  }
+  return match[1]
+}
+
+function normalizeOllamaNativeToolCalls(
+  toolCalls: OpenAIMessage['tool_calls'],
+): OllamaChatMessage['tool_calls'] {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+    return undefined
+  }
+
+  const normalized = toolCalls
+    .map(toolCall => {
+      const name = toolCall.function?.name
+      if (!name) {
+        return null
+      }
+
+      let args: Record<string, unknown> = {}
+      try {
+        const parsed = JSON.parse(toolCall.function.arguments || '{}')
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          args = parsed as Record<string, unknown>
+        }
+      } catch {
+        args = {}
+      }
+
+      return {
+        function: {
+          name,
+          arguments: args,
+        },
+      }
+    })
+    .filter((toolCall): toolCall is NonNullable<typeof toolCall> => toolCall !== null)
+
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function normalizeOllamaNativeMessages(messages: unknown): OllamaChatMessage[] {
+  if (!Array.isArray(messages)) {
+    return []
+  }
+
+  return messages.map(message => {
+    const openAIMessage = message as OpenAIMessage
+    const content = openAIMessage.content
+    const toolCalls = normalizeOllamaNativeToolCalls(openAIMessage.tool_calls)
+    if (!Array.isArray(content)) {
+      return {
+        ...openAIMessage,
+        content,
+        ...(toolCalls ? { tool_calls: toolCalls } : { tool_calls: undefined }),
+      }
+    }
+
+    const textParts: string[] = []
+    const images: string[] = []
+
+    for (const part of content) {
+      if (part.type === 'text') {
+        if (part.text) {
+          textParts.push(part.text)
+        }
+        continue
+      }
+
+      if (part.type === 'image_url') {
+        const imageUrl = part.image_url.url
+        const imageData = extractOllamaImageData(imageUrl)
+        if (imageData) {
+          images.push(imageData)
+        } else {
+          textParts.push(`[Image: ${imageUrl}]`)
+        }
+      }
+    }
+
+    return {
+      ...openAIMessage,
+      content: textParts.join('\n'),
+      ...(images.length > 0 ? { images } : {}),
+      ...(toolCalls ? { tool_calls: toolCalls } : { tool_calls: undefined }),
+    }
+  })
+}
+
+function mapOllamaDoneReason(doneReason: unknown): string | null {
+  if (doneReason === 'length') return 'length'
+  if (doneReason === 'stop') return 'stop'
+  if (typeof doneReason === 'string' && doneReason) return doneReason
+  return null
+}
+
+function normalizeOllamaToolCalls(
+  toolCalls: NonNullable<OllamaChatResponse['message']>['tool_calls'],
+): Array<{
+  id: string
+  type: 'function'
+  function: { name: string; arguments: string }
+}> | undefined {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+    return undefined
+  }
+
+  const normalized = toolCalls
+    .map(toolCall => {
+      const name = toolCall.function?.name
+      if (!name) {
+        return null
+      }
+      const args = toolCall.function?.arguments
+      return {
+        id: `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+        type: 'function' as const,
+        function: {
+          name,
+          arguments:
+            typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+        },
+      }
+    })
+    .filter((toolCall): toolCall is NonNullable<typeof toolCall> => toolCall !== null)
+
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function buildOpenAIUsageFromOllama(data: OllamaChatResponse) {
+  const promptTokens = data.prompt_eval_count ?? 0
+  const completionTokens = data.eval_count ?? 0
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+  }
+}
+
+function convertOllamaChatResponseToOpenAI(
+  data: OllamaChatResponse,
+  fallbackModel: string,
+): Record<string, unknown> {
+  const toolCalls = normalizeOllamaToolCalls(data.message?.tool_calls)
+  return {
+    id: makeMessageId(),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: data.model ?? fallbackModel,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: data.message?.content ?? '',
+          ...(toolCalls ? { tool_calls: toolCalls } : {}),
+        },
+        finish_reason: mapOllamaDoneReason(data.done_reason),
+      },
+    ],
+    usage: buildOpenAIUsageFromOllama(data),
+  }
+}
+
+function responseWithPreservedUrl(
+  body: BodyInit | null,
+  init: ResponseInit,
+  url: string,
+): Response {
+  const response = new Response(body, init)
+  try {
+    Object.defineProperty(response, 'url', {
+      value: url,
+      configurable: true,
+    })
+  } catch {
+    /* some runtimes lock the property; downstream has transport fallback */
+  }
+  return response
+}
+
+async function convertOllamaNonStreamingResponse(
+  response: Response,
+  fallbackModel: string,
+): Promise<Response> {
+  const data = await response.json() as OllamaChatResponse
+  return responseWithPreservedUrl(
+    JSON.stringify(convertOllamaChatResponseToOpenAI(data, fallbackModel)),
+    {
+      status: response.status,
+      statusText: response.statusText,
+      headers: { 'content-type': 'application/json' },
+    },
+    response.url,
+  )
+}
+
+function openAIStreamChunk(
+  id: string,
+  model: string,
+  delta: Record<string, unknown>,
+  finishReason: string | null = null,
+): string {
+  return `data: ${JSON.stringify({
+    id,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })}\n\n`
+}
+
+function convertOllamaStreamingResponse(
+  response: Response,
+  fallbackModel: string,
+): Response {
+  const body = response.body
+  if (!body) {
+    return response
+  }
+
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  const reader = body.getReader()
+  const streamId = makeMessageId()
+  let buffer = ''
+  let hasEmittedRole = false
+  let hasEmittedToolCall = false
+
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) {
+          if (buffer.trim()) {
+            enqueueOllamaLineAsOpenAI(buffer.trim(), controller)
+            buffer = ''
+          }
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+          return
+        }
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split(/\r?\n/)
+        buffer = lines.pop() ?? ''
+
+        let emittedLine = false
+        for (const line of lines) {
+          if (line.trim()) {
+            enqueueOllamaLineAsOpenAI(line.trim(), controller)
+            emittedLine = true
+          }
+        }
+        if (emittedLine) {
+          return
+        }
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason)
+    },
+  })
+
+  function enqueueOllamaLineAsOpenAI(
+    line: string,
+    controller: ReadableStreamDefaultController<Uint8Array>,
+  ): void {
+    let data: OllamaChatResponse
+    try {
+      data = JSON.parse(line) as OllamaChatResponse
+    } catch {
+      return
+    }
+
+    const model = data.model ?? fallbackModel
+    const chunks: string[] = []
+    const delta: Record<string, unknown> = {}
+    if (!hasEmittedRole) {
+      delta.role = 'assistant'
+      hasEmittedRole = true
+    }
+    if (data.message?.content) {
+      delta.content = data.message.content
+    }
+    const toolCalls = normalizeOllamaToolCalls(data.message?.tool_calls)
+    if (toolCalls) {
+      hasEmittedToolCall = true
+      delta.tool_calls = toolCalls.map((toolCall, index) => ({
+        index,
+        id: toolCall.id,
+        type: toolCall.type,
+        function: toolCall.function,
+      }))
+    }
+    if (Object.keys(delta).length > 0) {
+      chunks.push(openAIStreamChunk(streamId, model, delta))
+    }
+    if (data.done) {
+      chunks.push(openAIStreamChunk(
+        streamId,
+        model,
+        {},
+        hasEmittedToolCall
+          ? 'tool_calls'
+          : mapOllamaDoneReason(data.done_reason),
+      ))
+      chunks.push(`data: ${JSON.stringify({
+        id: streamId,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [],
+        usage: buildOpenAIUsageFromOllama(data),
+      })}\n\n`)
+    }
+
+    for (const chunk of chunks) {
+      controller.enqueue(encoder.encode(chunk))
+    }
+  }
+
+  return responseWithPreservedUrl(
+    stream,
+    {
+      status: response.status,
+      statusText: response.statusText,
+      headers: { 'content-type': 'text/event-stream' },
+    },
+    response.url,
+  )
 }
 
 function convertSystemPrompt(
@@ -306,10 +715,32 @@ function convertSystemPrompt(
   return String(system)
 }
 
+function ensureTextPartForImageContent(
+  parts: OpenAIContentPart[],
+): OpenAIContentPart[] {
+  const hasImage = parts.some(part => part.type === 'image_url')
+  if (!hasImage) {
+    return parts
+  }
+
+  const hasText = parts.some(
+    part => part.type === 'text' && (part.text ?? '').trim().length > 0,
+  )
+  if (hasText) {
+    return parts
+  }
+
+  return [{ type: 'text', text: 'Image attached.' }, ...parts]
+}
+
+function joinTextContentParts(parts: OpenAIContentPart[]): string {
+  return parts.map(part => part.type === 'text' ? part.text : '').join('')
+}
+
 function convertToolResultContent(
   content: unknown,
   isError?: boolean,
-): string | Array<{ type: string; text?: string; image_url?: { url: string } }> {
+): string | OpenAIContentPart[] {
   if (typeof content === 'string') {
     return isError ? `Error: ${content}` : content
   }
@@ -318,14 +749,21 @@ function convertToolResultContent(
     return isError ? `Error: ${text}` : text
   }
 
-  const parts: Array<{
-    type: string
-    text?: string
-    image_url?: { url: string }
-  }> = []
+  const parts: OpenAIContentPart[] = []
   for (const block of content) {
     if (block?.type === 'text' && typeof block.text === 'string') {
       parts.push({ type: 'text', text: block.text })
+      continue
+    }
+
+    // ToolSearch results are tool_reference blocks with no text payload —
+    // render them so the model learns which deferred tools were loaded
+    // (their schemas arrive in the next request's tools array).
+    if (block?.type === 'tool_reference' && typeof block.tool_name === 'string') {
+      parts.push({
+        type: 'text',
+        text: `Tool "${block.tool_name}" is now loaded and available to call.`,
+      })
       continue
     }
 
@@ -369,16 +807,21 @@ function convertToolResultContent(
     parts.unshift({ type: 'text', text: 'Error:' })
   }
 
-  return parts
+  // Defense in depth (issue #1421): some OpenAI-compatible providers (e.g.
+  // Xiaomi Mimo) reject `role: "tool"` messages whose `content` is image-only
+  // with a 400 "text is not set". Prepend a placeholder text part so the
+  // payload always carries a text component alongside any images, mirroring
+  // the existing behavior for user-role messages.
+  return ensureTextPartForImageContent(parts)
 }
 
 function convertContentBlocks(
   content: unknown,
-): string | Array<{ type: string; text?: string; image_url?: { url: string } }> {
+): string | OpenAIContentPart[] {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return String(content ?? '')
 
-  const parts: Array<{ type: string; text?: string; image_url?: { url: string } }> = []
+  const parts: OpenAIContentPart[] = []
   for (const block of content) {
     switch (block.type) {
       case 'text':
@@ -429,7 +872,7 @@ function convertContentBlocks(
     return parts.map(p => p.text ?? '').join('\n\n')
   }
 
-  return parts
+  return ensureTextPartForImageContent(parts)
 }
 
 function isGeminiMode(): boolean {
@@ -462,8 +905,12 @@ function hydrateOpenAIShimCompatibilityEnv(
   }
 
   if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_GITHUB)) {
-    processEnv.OPENAI_API_KEY ??=
-      processEnv.GITHUB_TOKEN ?? processEnv.GH_TOKEN ?? ''
+    processEnv.OPENAI_API_KEY =
+      processEnv.GITHUB_COPILOT_KEY ??
+      processEnv.OPENAI_API_KEY ??
+      processEnv.GITHUB_TOKEN ??
+      processEnv.GH_TOKEN ??
+      ''
     return
   }
 
@@ -583,10 +1030,15 @@ function convertMessages(
           (b: { type?: string }) => b.type === 'tool_use',
         )
         const thinkingBlock = content.find(
-          (b: { type?: string }) => b.type === 'thinking',
+          (b: { type?: string }) =>
+            b.type === 'thinking' ||
+            b.type === 'redacted_thinking',
         )
         const textContent = content.filter(
-          (b: { type?: string }) => b.type !== 'tool_use' && b.type !== 'thinking',
+          (b: { type?: string }) =>
+            b.type !== 'tool_use' &&
+            b.type !== 'thinking' &&
+            b.type !== 'redacted_thinking',
         )
 
         const assistantMsg: OpenAIMessage = {
@@ -596,7 +1048,7 @@ function convertMessages(
             return typeof c === 'string'
               ? c
               : Array.isArray(c)
-                ? c.map((p: { text?: string }) => p.text ?? '').join('')
+                ? joinTextContentParts(c)
                 : ''
           })(),
         }
@@ -610,7 +1062,17 @@ function convertMessages(
         // Gated per-provider because other endpoints either ignore the field
         // (harmless) or strict-reject unknown fields (harmful).
         if (preserveReasoningContent) {
-          const thinkingText = (thinkingBlock as { thinking?: string } | undefined)?.thinking
+          // `thinking` blocks carry their content in `.thinking`; `redacted_thinking`
+          // blocks carry it in `.data` (see token estimation and message-size
+          // accounting). Read the right field per type so a real redacted block
+          // with non-empty content is not silently dropped to "".
+          const block = thinkingBlock as
+            | { type?: string; thinking?: string; data?: string }
+            | undefined
+          const thinkingText =
+            block?.type === 'redacted_thinking'
+              ? block?.data
+              : block?.thinking
           if (typeof thinkingText === 'string' && thinkingText.trim().length > 0) {
             assistantMsg.reasoning_content = thinkingText
           } else if (
@@ -699,7 +1161,7 @@ function convertMessages(
             return typeof c === 'string'
               ? c
               : Array.isArray(c)
-                ? c.map((p: { text?: string }) => p.text ?? '').join('')
+                ? joinTextContentParts(c)
                 : ''
           })(),
         }
@@ -721,13 +1183,14 @@ function convertMessages(
     const prev = coalesced[coalesced.length - 1]
 
     // Mistral/Devstral: 'tool' message must be followed by an 'assistant' message.
-    // If a 'tool' result is followed by a 'user' message, we must inject a semantic
-    // assistant response to satisfy the strict role sequence:
+    // If a 'tool' result is followed by a 'user' message, inject a neutral
+    // assistant boundary to satisfy the strict role sequence without implying
+    // that the user interrupted or cancelled anything:
     // ... -> assistant (calls) -> tool (results) -> assistant (semantic) -> user (next)
     if (prev && prev.role === 'tool' && msg.role === 'user') {
       coalesced.push({
         role: 'assistant',
-        content: '[Tool execution interrupted by user]',
+        content: '[Tool results received]',
       })
     }
 
@@ -746,15 +1209,8 @@ function convertMessages(
           prevContent + (prevContent && curContent ? '\n' : '') + curContent
       } else {
         const toArray = (
-          c:
-            | string
-            | Array<{ type: string; text?: string; image_url?: { url: string } }>
-            | undefined,
-        ): Array<{
-          type: string
-          text?: string
-          image_url?: { url: string }
-        }> => {
+          c: string | OpenAIContentPart[] | undefined,
+        ): OpenAIContentPart[] => {
           if (!c) return []
           if (typeof c === 'string') return c ? [{ type: 'text', text: c }] : []
           return c
@@ -1006,6 +1462,293 @@ function repairPossiblyTruncatedObjectJson(raw: string): string | null {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Ollama text-based tool call parser (fix for #1053)
+//
+// When Ollama models cannot emit structured tool_calls via the OpenAI-compat
+// API, they fall back to printing the call as a JSON block in the response
+// text. This parser extracts those calls so the agent loop can execute them.
+//
+// Supported formats emitted by qwen2.5-coder, llama3.x, phi-4, gemma:
+//   ```json\n{"name":"X","arguments":{...}}\n```
+//   {"name":"X","arguments":{...}}
+//   {"type":"function","function":{"name":"X","arguments":{...}}}
+// ---------------------------------------------------------------------------
+
+// Fenced code block arm: non-greedy is safe because ``` acts as terminator.
+const FENCED_TOOL_CALL_RE = /```(?:json)?\s*\n?\s*(\{[\s\S]*?\})\s*\n?\s*```/g
+// Bare JSON arm: marks candidate start positions only; balanced extraction follows.
+// Allow optional whitespace (including newlines) before the property key so
+// pretty-printed objects like "{\n  \"name\":" are detected.
+const BARE_TOOL_CALL_START_RE = /\{\s*"(?:name|type)"\s*:/g
+
+interface ParsedTextToolCall {
+  id: string
+  name: string
+  arguments: Record<string, unknown>
+}
+
+// Module-level counter ensures unique IDs across calls within a session.
+let _textToolCallCounter = 0
+
+// Walks forward from `start` (which must be `{`) tracking string/escape/brace
+// state and returns the substring up to and including the matching `}`, or
+// null if the braces are never balanced (truncated input).
+function extractBalancedJson(text: string, start: number): string | null {
+  let depth = 0
+  let inString = false
+  let escape = false
+  for (let i = start; i < text.length; i++) {
+    const c = text[i]!
+    if (escape) { escape = false; continue }
+    if (c === '\\' && inString) { escape = true; continue }
+    if (c === '"') { inString = !inString; continue }
+    if (inString) continue
+    if (c === '{') depth++
+    else if (c === '}') {
+      depth--
+      if (depth === 0) return text.slice(start, i + 1)
+    }
+  }
+  return null
+}
+
+function parseAndAdd(
+  raw: string,
+  results: ParsedTextToolCall[],
+  seen: Set<string>,
+): boolean {
+  let obj: Record<string, unknown>
+  try {
+    obj = JSON.parse(raw)
+  } catch {
+    return false
+  }
+
+  let name: string | undefined
+  let args: Record<string, unknown> = {}
+
+  if (typeof obj['name'] === 'string') {
+    // {"name": "X", "arguments": {...}}
+    name = obj['name'] as string
+    args = (obj['arguments'] as Record<string, unknown>) ?? {}
+  } else if (
+    obj['type'] === 'function' &&
+    typeof (obj['function'] as any)?.name === 'string'
+  ) {
+    // {"type":"function","function":{"name":"X","arguments":{...}}}
+    const fn = obj['function'] as { name: string; arguments?: unknown }
+    name = fn.name
+    const rawArgs = fn.arguments
+    args =
+      typeof rawArgs === 'string'
+        ? (() => {
+            try {
+              return JSON.parse(rawArgs)
+            } catch {
+              return {}
+            }
+          })()
+        : (rawArgs as Record<string, unknown>) ?? {}
+  }
+
+  if (!name) return false
+
+  const dedupKey = `${name}:${JSON.stringify(args)}`
+  if (seen.has(dedupKey)) return false
+  seen.add(dedupKey)
+
+  results.push({ id: `ollama_tc_${++_textToolCallCounter}`, name, arguments: args })
+  return true
+}
+
+/** Removes character ranges from `text`, returning the remaining content. */
+function stripRanges(text: string, ranges: Array<[number, number]>): string {
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0])
+  let result = ''
+  let pos = 0
+  for (const [s, e] of sorted) {
+    result += text.slice(pos, s)
+    pos = e
+  }
+  return result + text.slice(pos)
+}
+
+/** Exported for unit testing only. */
+export function parseTextToolCalls(text: string): {
+  calls: ParsedTextToolCall[]
+  toolCallRanges: Array<[number, number]>
+} {
+  const results: ParsedTextToolCall[] = []
+  const seen = new Set<string>()
+  const fencedRanges: Array<[number, number]> = []
+  // acceptedRanges tracks only ranges where parseAndAdd confirmed a valid tool
+  // call was emitted — these are what callers strip from text.  fencedRanges
+  // (all fenced blocks regardless of acceptance) is kept separately so Pass 2
+  // can skip over them and avoid double-processing.
+  const acceptedRanges: Array<[number, number]> = []
+
+  // Pass 1: fenced code blocks — regex is safe, ``` bounds the non-greedy match.
+  // Context guard: same heuristic as Pass 2 — if non-whitespace, non-`{` text
+  // immediately follows the closing fence, the model is explaining a format rather
+  // than calling a tool; skip to avoid false positives on fenced examples.
+  for (const match of text.matchAll(FENCED_TOOL_CALL_RE)) {
+    const raw = (match[1] ?? '').trim()
+    const after = text.slice(match.index! + match[0].length).trimStart()
+    if (after.length > 0 && !after.startsWith('{')) continue
+    const range: [number, number] = [match.index!, match.index! + match[0].length]
+    fencedRanges.push(range)
+    if (raw && parseAndAdd(raw, results, seen)) {
+      acceptedRanges.push(range)
+    }
+  }
+
+  // Pass 2: bare JSON — use the brace scanner so nested objects are captured fully.
+  // processedRanges grows as we extract; inner objects nested inside an outer
+  // tool call are skipped because their start falls inside an already-extracted range.
+  const processedRanges: Array<[number, number]> = [...fencedRanges]
+  for (const match of text.matchAll(BARE_TOOL_CALL_START_RE)) {
+    const start = match.index!
+    if (processedRanges.some(([s, e]) => start >= s && start < e)) continue
+    const raw = extractBalancedJson(text, start)
+    if (raw) {
+      // Context guard: if non-whitespace, non-`{` text immediately follows the JSON
+      // the model is likely explaining, not calling — skip to avoid false positives.
+      const after = text.slice(start + raw.length).trimStart()
+      if (after.length > 0 && !after.startsWith('{')) continue
+      const range: [number, number] = [start, start + raw.length]
+      processedRanges.push(range)
+      if (parseAndAdd(raw, results, seen)) {
+        acceptedRanges.push(range)
+      }
+    }
+  }
+
+  return { calls: results, toolCallRanges: acceptedRanges }
+}
+
+// ---------------------------------------------------------------------------
+// XML tool call parser (GLM / Qwen / DeepSeek family)
+//
+// Several open models routed through OpenAI-compatible gateways emit tool
+// calls as XML text inside the assistant message rather than as structured
+// `tool_calls`. Without recovery these leak into visible prose and never
+// execute — the turn then ends with no tool_use block, so the agent appears
+// to "forget" and stop mid-task. We support the three dialects seen in the
+// wild:
+//   A. <tool_call><function=NAME><parameter=KEY>VALUE</parameter>…</function></tool_call>
+//   B. <tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>…</tool_call>  (GLM native)
+//   C. <tool_call>{"name":"NAME","arguments":{…}}</tool_call>                          (Hermes JSON)
+// ---------------------------------------------------------------------------
+
+// The streaming finalize path buffers from this opener onward so the raw XML
+// is never surfaced as text before extraction.
+const XML_TOOL_CALL_OPEN = '<tool_call>'
+// Non-greedy block matcher; the `$` alternative tolerates a truncated final
+// block (stream cut off before the closing tag).
+const XML_TOOL_CALL_BLOCK_RE = /<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/g
+const XML_FUNCTION_NAME_RE = /<function=([^>\s]+)\s*>/
+const XML_PARAMETER_RE = /<parameter=([^>\s]+)\s*>([\s\S]*?)<\/parameter>/g
+const XML_ARG_PAIR_RE = /<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/g
+
+// Parameter/arg values arrive as untyped text. Try JSON first so numbers,
+// booleans, and nested objects round-trip; fall back to the raw string.
+function coerceXmlToolValue(raw: string): unknown {
+  const trimmed = raw.trim()
+  if (trimmed === '') return ''
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    return raw
+  }
+}
+
+/**
+ * Returns the length of the longest suffix of `s` that is a (proper) prefix of
+ * the `<tool_call>` opener. Used by the stream to hold back a trailing partial
+ * opener split across SSE deltas so it is never emitted as visible text.
+ */
+function trailingXmlOpenerPrefixLen(s: string): number {
+  const max = Math.min(s.length, XML_TOOL_CALL_OPEN.length - 1)
+  for (let len = max; len > 0; len--) {
+    if (XML_TOOL_CALL_OPEN.startsWith(s.slice(s.length - len))) return len
+  }
+  return 0
+}
+
+/** Exported for unit testing only. */
+export function parseXmlToolCalls(text: string): {
+  calls: ParsedTextToolCall[]
+  toolCallRanges: Array<[number, number]>
+} {
+  const results: ParsedTextToolCall[] = []
+  const seen = new Set<string>()
+  const ranges: Array<[number, number]> = []
+
+  for (const block of text.matchAll(XML_TOOL_CALL_BLOCK_RE)) {
+    const inner = block[1] ?? ''
+    const range: [number, number] = [
+      block.index!,
+      block.index! + block[0].length,
+    ]
+    let name: string | undefined
+    const args: Record<string, unknown> = {}
+
+    const fnMatch = inner.match(XML_FUNCTION_NAME_RE)
+    if (fnMatch) {
+      // Dialect A: <function=NAME><parameter=KEY>VALUE</parameter>…
+      name = fnMatch[1]
+      for (const p of inner.matchAll(XML_PARAMETER_RE)) {
+        const key = p[1]
+        if (key) args[key] = coerceXmlToolValue(p[2] ?? '')
+      }
+    } else {
+      const trimmedInner = inner.trim()
+      const argPairs = [...inner.matchAll(XML_ARG_PAIR_RE)]
+      if (argPairs.length > 0 && !trimmedInner.startsWith('{')) {
+        // Dialect B: leading token is the function name, then arg_key/arg_value.
+        const nameTok = trimmedInner.split(/[\n<]/, 1)[0]?.trim()
+        if (nameTok) name = nameTok
+        for (const p of argPairs) {
+          const key = (p[1] ?? '').trim()
+          if (key) args[key] = coerceXmlToolValue(p[2] ?? '')
+        }
+      } else {
+        // Dialect C: a JSON tool-call object inside the tags.
+        const jsonStart = trimmedInner.indexOf('{')
+        if (jsonStart !== -1) {
+          const jsonRaw = extractBalancedJson(trimmedInner, jsonStart)
+          if (jsonRaw) {
+            try {
+              const obj = JSON.parse(jsonRaw) as Record<string, unknown>
+              if (typeof obj['name'] === 'string') {
+                name = obj['name'] as string
+                const rawArgs = obj['arguments']
+                if (typeof rawArgs === 'string') {
+                  try {
+                    Object.assign(args, JSON.parse(rawArgs))
+                  } catch {}
+                } else if (rawArgs && typeof rawArgs === 'object') {
+                  Object.assign(args, rawArgs as Record<string, unknown>)
+                }
+              }
+            } catch {}
+          }
+        }
+      }
+    }
+
+    if (!name) continue
+    ranges.push(range)
+    const dedupKey = `${name}:${JSON.stringify(args)}`
+    if (seen.has(dedupKey)) continue
+    seen.add(dedupKey)
+    results.push({ id: `xml_tc_${++_textToolCallCounter}`, name, arguments: args })
+  }
+
+  return { calls: results, toolCallRanges: ranges }
+}
+
 /**
  * Async generator that transforms an OpenAI SSE stream into
  * Anthropic-format BetaRawMessageStreamEvent objects.
@@ -1020,15 +1763,17 @@ async function* anthropicSsePassthrough(
   _model: string,
   signal?: AbortSignal,
 ): AsyncGenerator<AnthropicStreamEvent> {
-  const reader = response.body?.getReader()
-  if (!reader) return
+  const readerOrNull = response.body?.getReader()
+  if (!readerOrNull) throw new Error('Response body is not readable')
+  const reader: ReadableStreamDefaultReader<Uint8Array> = readerOrNull
   const decoder = new TextDecoder()
   let buffer = ''
 
   // Read helper that properly cleans up abort listeners (mirrors codexShim.ts pattern).
-  function readWithAbort(): Promise<ReadableStreamReadResult<Uint8Array>> {
+  type ReadResult = Awaited<ReturnType<typeof reader.read>>
+  function readWithAbort(): Promise<ReadResult> {
     if (!signal) return reader.read()
-    return new Promise((resolve, reject) => {
+    return new Promise<ReadResult>((resolve, reject) => {
       const onAbort = () => reject(new DOMException('Aborted', 'AbortError'))
       signal.addEventListener('abort', onAbort, { once: true })
       reader.read().then(
@@ -1081,8 +1826,8 @@ async function* geminiSseToAnthropic(
   model: string,
   signal?: AbortSignal,
 ): AsyncGenerator<AnthropicStreamEvent> {
-  const reader = response.body?.getReader()
-  if (!reader) return
+  const reader: ReadableStreamDefaultReader<Uint8Array> | undefined = response.body?.getReader()
+  if (!reader) throw new Error('Response body is not readable')
   const decoder = new TextDecoder()
   let buffer = ''
   const messageId = makeMessageId()
@@ -1094,12 +1839,12 @@ async function* geminiSseToAnthropic(
   let finishReason: string | undefined
 
   function readWithAbort(): Promise<ReadableStreamReadResult<Uint8Array>> {
-    if (!signal) return reader.read()
+    if (!signal) return reader!.read() as Promise<ReadableStreamReadResult<Uint8Array>>
     return new Promise((resolve, reject) => {
       const onAbort = () => reject(new DOMException('Aborted', 'AbortError'))
       signal.addEventListener('abort', onAbort, { once: true })
-      reader.read().then(
-        result => { signal.removeEventListener('abort', onAbort); resolve(result) },
+      reader!.read().then(
+        result => { signal.removeEventListener('abort', onAbort); resolve(result as ReadableStreamReadResult<Uint8Array>) },
         err => { signal.removeEventListener('abort', onAbort); reject(err) },
       )
     })
@@ -1254,6 +1999,7 @@ async function* openaiStreamToAnthropic(
   response: Response,
   model: string,
   signal?: AbortSignal,
+  isOllama = false,
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = makeMessageId()
   let contentBlockIndex = 0
@@ -1274,8 +2020,22 @@ async function* openaiStreamToAnthropic(
   let lastStopReason: 'tool_use' | 'max_tokens' | 'end_turn' | null = null
   let hasEmittedFinalUsage = false
   let hasProcessedFinishReason = false
+  // Accumulated text for Ollama text-based tool call fallback parsing (#1053)
+  let accumulatedText = ''
+  // Use the resolved value threaded from the call site (resolveProviderRequest)
+  // rather than re-reading env vars inside the generator.
+  const isOllamaStream = isOllama
+  // Buffer Ollama text deltas so raw tool-call JSON is never emitted as text_delta
+  // before extraction at finish_reason=stop (P2 fix for #1053).
+  let ollamaTextBuffer = ''
   const streamState = createStreamState()
   let bufferedRawToolCallsText: string | null = null
+  // XML tool-call fallback (GLM/Qwen-style `<tool_call><function=…>` emitted as
+  // text). Once the opener is seen we stop emitting text and buffer the
+  // remainder in xmlToolCallText, converting it to tool_use blocks at finalize.
+  // xmlHoldback retains a trailing partial opener split across deltas.
+  let xmlToolCallText: string | null = null
+  let xmlHoldback = ''
 
   // Emit message_start
   yield {
@@ -1297,8 +2057,9 @@ async function* openaiStreamToAnthropic(
     },
   }
 
-  const reader = response.body?.getReader()
-  if (!reader) return
+  const readerOrNull = response.body?.getReader()
+  if (!readerOrNull) throw new Error('Response body is not readable')
+  const reader: ReadableStreamDefaultReader<Uint8Array> = readerOrNull
 
   const decoder = new TextDecoder()
   let buffer = ''
@@ -1313,8 +2074,9 @@ async function* openaiStreamToAnthropic(
    * Respects the caller's AbortSignal — clears the idle timer on abort
    * so the rejection reason is AbortError, not a spurious idle timeout.
    */
-  async function readWithTimeout(): Promise<ReadableStreamReadResult<Uint8Array>> {
-    return new Promise((resolve, reject) => {
+  type ReadResult = Awaited<ReturnType<typeof reader.read>>
+  async function readWithTimeout(): Promise<ReadResult> {
+    return new Promise<ReadResult>((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         const elapsed = Math.round((Date.now() - lastDataTime) / 1000)
         reject(new Error(
@@ -1509,7 +2271,16 @@ async function* openaiStreamToAnthropic(
             hasClosedThinking = true
           }
 
-          if (
+          accumulatedText += delta.content
+          if (isOllamaStream) {
+            const visible = thinkFilter.feed(delta.content)
+            if (visible) {
+              ollamaTextBuffer += visible
+            }
+          } else if (xmlToolCallText !== null) {
+            // Inside an XML tool-call region — buffer, emit nothing visible.
+            xmlToolCallText += delta.content
+          } else if (
             !hasEmittedContentStart &&
             bufferedRawToolCallsText === null &&
             couldBeRawToolCallsRequestedPrefix(delta.content)
@@ -1524,12 +2295,40 @@ async function* openaiStreamToAnthropic(
               bufferedRawToolCallsText = null
             }
           } else {
-            yield* emitTextDelta(delta.content)
+            // Watch for an XML tool-call opener that may be split across deltas.
+            // Everything from `<tool_call>` onward is held back (never shown) and
+            // converted to tool_use blocks at finalize; prose before it streams
+            // normally, minus a trailing partial-opener prefix.
+            const combined = xmlHoldback + delta.content
+            const openIdx = combined.indexOf(XML_TOOL_CALL_OPEN)
+            if (openIdx !== -1) {
+              const before = combined.slice(0, openIdx)
+              if (before) yield* emitTextDelta(before)
+              xmlHoldback = ''
+              xmlToolCallText = combined.slice(openIdx)
+            } else {
+              const keep = trailingXmlOpenerPrefixLen(combined)
+              const emit =
+                keep > 0 ? combined.slice(0, combined.length - keep) : combined
+              xmlHoldback = keep > 0 ? combined.slice(combined.length - keep) : ''
+              if (emit) yield* emitTextDelta(emit)
+            }
           }
         }
 
         // Tool calls
         if (delta.tool_calls) {
+          // Structured tool calls arrived — any held-back XML was a false
+          // positive (the model uses one mechanism or the other). Flush it
+          // as text so nothing is lost.
+          if (xmlToolCallText !== null) {
+            yield* emitTextDelta(xmlToolCallText)
+            xmlToolCallText = null
+          }
+          if (xmlHoldback) {
+            yield* emitTextDelta(xmlHoldback)
+            xmlHoldback = ''
+          }
           if (bufferedRawToolCallsText !== null) {
             const parsedBufferedToolCalls = parseRawToolCallsRequestedText(
               bufferedRawToolCallsText,
@@ -1549,6 +2348,26 @@ async function* openaiStreamToAnthropic(
                 yield { type: 'content_block_stop', index: contentBlockIndex }
                 contentBlockIndex++
                 hasClosedThinking = true
+              }
+              // Flush buffered Ollama text before processing the tool call.
+              // Must run before hasEmittedContentStart check because for Ollama
+              // streams the text block may not have been opened yet (we buffer
+              // instead of emitting during the streaming phase).
+              if (isOllamaStream && ollamaTextBuffer) {
+                if (!hasEmittedContentStart) {
+                  yield {
+                    type: 'content_block_start',
+                    index: contentBlockIndex,
+                    content_block: { type: 'text', text: '' },
+                  }
+                  hasEmittedContentStart = true
+                }
+                yield {
+                  type: 'content_block_delta',
+                  index: contentBlockIndex,
+                  delta: { type: 'text_delta', text: ollamaTextBuffer },
+                }
+                ollamaTextBuffer = ''
               }
               if (hasEmittedContentStart) {
                 yield* closeActiveContentBlock()
@@ -1635,6 +2454,145 @@ async function* openaiStreamToAnthropic(
             contentBlockIndex++
             hasClosedThinking = true
           }
+          // Ollama text-based tool call fallback (#1053):
+          // Must run before closeActiveContentBlock so the text buffer can be flushed
+          // with tool-call JSON stripped (P2). Ollama models emit tool calls as raw
+          // JSON text; scan accumulated text on any terminal finish reason with no
+          // API tool calls. finish_reason is mutated to 'tool_calls' only for 'stop'
+          // so the JSON fallback remains scoped to normal completions.
+          const OLLAMA_TERMINAL_REASONS = new Set(['stop', 'length', 'content_filter', 'safety'])
+          const isTerminalOllamaFinish =
+            OLLAMA_TERMINAL_REASONS.has(choice.finish_reason ?? '') &&
+            activeToolCalls.size === 0 &&
+            isOllamaStream
+          const originalFinishReason = choice.finish_reason
+          let ollamaClosedContentBlock = false
+          if (isTerminalOllamaFinish) {
+            const { calls: textToolCalls, toolCallRanges } = parseTextToolCalls(accumulatedText)
+            if (textToolCalls.length > 0) {
+              ollamaClosedContentBlock = true
+              // Compute visible prose (tool-call JSON stripped, think-tags removed).
+              // Use accumulatedText (raw) as source because toolCallRanges are relative to it.
+              const stripped = stripRanges(accumulatedText, toolCallRanges).trim()
+              const strippedVisible = stripThinkTags(stripped).trim()
+              if (hasEmittedContentStart) {
+                // Text block was already open — emit stripped prose then close it.
+                if (strippedVisible) {
+                  yield {
+                    type: 'content_block_delta',
+                    index: contentBlockIndex,
+                    delta: { type: 'text_delta', text: strippedVisible },
+                  }
+                }
+                yield* closeActiveContentBlock()
+              } else if (strippedVisible) {
+                // Text was buffered (Ollama path, hasEmittedContentStart === false).
+                // Open a text block, emit the visible prose before the tool call, close it.
+                yield {
+                  type: 'content_block_start',
+                  index: contentBlockIndex,
+                  content_block: { type: 'text', text: '' },
+                }
+                hasEmittedContentStart = true
+                yield {
+                  type: 'content_block_delta',
+                  index: contentBlockIndex,
+                  delta: { type: 'text_delta', text: strippedVisible },
+                }
+                yield* closeActiveContentBlock()
+              }
+              for (const tc of textToolCalls) {
+                const toolBlockIndex = contentBlockIndex
+                yield {
+                  type: 'content_block_start',
+                  index: toolBlockIndex,
+                  content_block: { type: 'tool_use', id: tc.id, name: tc.name, input: {} },
+                }
+                contentBlockIndex++
+                yield {
+                  type: 'content_block_delta',
+                  index: toolBlockIndex,
+                  delta: { type: 'input_json_delta', partial_json: JSON.stringify(tc.arguments) },
+                }
+                yield { type: 'content_block_stop', index: toolBlockIndex }
+              }
+              // Only remap finish_reason to 'tool_calls' for the normal stop case;
+              // non-stop terminal reasons keep their original reason.
+              if (originalFinishReason === 'stop') {
+                choice.finish_reason = 'tool_calls'
+              }
+            } else if (ollamaTextBuffer) {
+              // No tool calls — flush the buffered text before the normal close below.
+              // Open a text block first if one is not already open (guards the edge case
+              // where hasEmittedContentStart is false but the buffer has content).
+              if (!hasEmittedContentStart) {
+                yield {
+                  type: 'content_block_start',
+                  index: contentBlockIndex,
+                  content_block: { type: 'text', text: '' },
+                }
+                hasEmittedContentStart = true
+              }
+              yield {
+                type: 'content_block_delta',
+                index: contentBlockIndex,
+                delta: { type: 'text_delta', text: ollamaTextBuffer },
+              }
+            }
+          }
+
+          // XML tool-call fallback for non-Ollama OpenAI-compatible providers
+          // (GLM/Qwen emit `<tool_call><function=…>` as text). Mirror the Ollama
+          // path: convert buffered XML to tool_use blocks and strip the raw XML.
+          let xmlClosedContentBlock = false
+          if (!isOllamaStream && xmlToolCallText !== null) {
+            const buffered = xmlToolCallText
+            xmlToolCallText = null
+            const { calls, toolCallRanges } = parseXmlToolCalls(buffered)
+            if (calls.length > 0) {
+              const stripped = stripRanges(buffered, toolCallRanges).trim()
+              const strippedVisible = stripThinkTags(stripped).trim()
+              if (strippedVisible) {
+                // emitTextDelta opens a text block if one is not already open;
+                // when prose preceded the opener the block is still open and we
+                // simply append the trailing prose to it.
+                yield* emitTextDelta(strippedVisible)
+              }
+              if (hasEmittedContentStart) {
+                yield* closeActiveContentBlock()
+                xmlClosedContentBlock = true
+              }
+              for (const tc of calls) {
+                const toolBlockIndex = contentBlockIndex
+                yield {
+                  type: 'content_block_start',
+                  index: toolBlockIndex,
+                  content_block: { type: 'tool_use', id: tc.id, name: tc.name, input: {} },
+                }
+                contentBlockIndex++
+                yield {
+                  type: 'content_block_delta',
+                  index: toolBlockIndex,
+                  delta: { type: 'input_json_delta', partial_json: JSON.stringify(tc.arguments) },
+                }
+                yield { type: 'content_block_stop', index: toolBlockIndex }
+              }
+              if (originalFinishReason === 'stop') {
+                choice.finish_reason = 'tool_calls'
+              }
+            } else {
+              // No valid tool calls parsed — the buffered text was a false
+              // positive (e.g. the model wrote about `<tool_call>` literally).
+              // Emit it verbatim so nothing is lost.
+              yield* emitTextDelta(buffered)
+            }
+          } else if (!isOllamaStream && xmlHoldback) {
+            // A trailing partial opener that never completed is just text.
+            yield* emitTextDelta(xmlHoldback)
+            xmlHoldback = ''
+          }
+
+          // Flush bufferedRawToolCallsText for non-Ollama providers
           const parsedBufferedToolCalls = bufferedRawToolCallsText
             ? parseRawToolCallsRequestedText(bufferedRawToolCallsText)
             : null
@@ -1645,8 +2603,10 @@ async function* openaiStreamToAnthropic(
             yield* emitTextDelta(bufferedRawToolCallsText)
             bufferedRawToolCallsText = null
           }
-          // Close any open content blocks
-          if (hasEmittedContentStart) {
+
+          // Close any open content blocks (skipped when the Ollama or XML
+          // fallback already closed it above)
+          if (hasEmittedContentStart && !ollamaClosedContentBlock && !xmlClosedContentBlock) {
             yield* closeActiveContentBlock()
           }
           // Close active tool calls
@@ -1824,11 +2784,29 @@ class OpenAIShimMessages {
   private defaultHeaders: Record<string, string>
   private reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'
   private providerOverride?: { model: string; baseURL: string; apiKey: string }
+  private credentialPool?: CredentialPool
+  private credentialPoolRaw?: string
 
   constructor(defaultHeaders: Record<string, string>, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', providerOverride?: { model: string; baseURL: string; apiKey: string }) {
     this.defaultHeaders = filterAnthropicHeaders(defaultHeaders)
     this.reasoningEffort = reasoningEffort
     this.providerOverride = providerOverride
+  }
+
+  private getCredentialPool(raw: string): CredentialPool | null {
+    const credentials = parseCredentialList(raw)
+    if (credentials.length === 0) {
+      this.credentialPool = undefined
+      this.credentialPoolRaw = undefined
+      return null
+    }
+
+    if (!this.credentialPool || this.credentialPoolRaw !== raw) {
+      this.credentialPool = new CredentialPool(credentials)
+      this.credentialPoolRaw = raw
+    }
+
+    return this.credentialPool
   }
 
   create(
@@ -1859,7 +2837,7 @@ class OpenAIShimMessages {
               ? anthropicSsePassthrough(response, request.resolvedModel, options?.signal)
               : isGeminiStream
                 ? geminiSseToAnthropic(response, request.resolvedModel, options?.signal)
-                : openaiStreamToAnthropic(response, request.resolvedModel, options?.signal),
+                : openaiStreamToAnthropic(response, request.resolvedModel, options?.signal, isLikelyOllamaEndpoint(request.baseUrl)),
         )
       }
 
@@ -1924,7 +2902,7 @@ class OpenAIShimMessages {
       throw APIError.generate(
         response.status,
         undefined,
-        `OpenAI API error ${response.status}: unexpected response: ${textBody.slice(0, 500)}`,
+        `OpenAI API error ${response.status}: unexpected response content-type: ${response.headers.get('content-type') ?? 'unknown'}`,
         response.headers as unknown as Headers,
       )
     })()
@@ -1950,30 +2928,59 @@ class OpenAIShimMessages {
   ): Promise<Response> {
     const githubEndpointType = getGithubEndpointType(request.baseUrl)
     const isGithubMode = isGithubModelsMode()
-    const isGithubWithCodexTransport = isGithubMode && request.transport === 'codex_responses'
+    const isGithubCopilotEndpoint = isGithubMode && (githubEndpointType === 'copilot' || githubEndpointType === 'ghe')
+    const isGithubWithCodexTransport = isGithubCopilotEndpoint && request.transport === 'codex_responses'
 
     if (isGithubWithCodexTransport) {
-      const apiKey = this.providerOverride?.apiKey ?? process.env.OPENAI_API_KEY ?? ''
-      if (!apiKey) {
-        throw new Error(
-          'GitHub Copilot auth is required. Run /onboard-github to sign in.',
-        )
-      }
+      let didRefreshCopilotCodexToken = false
+      let refreshedCopilotCodexToken: string | undefined
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const apiKey = refreshedCopilotCodexToken ?? this.providerOverride?.apiKey ?? process.env.OPENAI_API_KEY ?? ''
+        if (!apiKey) {
+          throw new Error(
+            'GitHub Copilot auth is required. Run /onboard-github to sign in.',
+          )
+        }
 
-      return performCodexRequest({
-        request,
-        credentials: {
-          apiKey,
-          source: 'env',
-        },
-        params,
-        defaultHeaders: {
-          ...this.defaultHeaders,
-          ...filterAnthropicHeaders(options?.headers),
-          ...COPILOT_HEADERS,
-        },
-        signal: options?.signal,
-      })
+        try {
+          return await performCodexRequest({
+            request,
+            credentials: {
+              apiKey,
+              source: 'env',
+            },
+            params,
+            defaultHeaders: {
+              ...this.defaultHeaders,
+              ...filterAnthropicHeaders(options?.headers),
+              ...COPILOT_HEADERS,
+            },
+            signal: options?.signal,
+          })
+        } catch (error) {
+          if (
+            !didRefreshCopilotCodexToken &&
+            error instanceof APIError &&
+            error.status === 401
+          ) {
+            if (
+              apiKey === (process.env.OPENAI_API_KEY ?? '') &&
+              isCopilotTokenExpiredError(error.message)
+            ) {
+              didRefreshCopilotCodexToken = true
+              const refreshed = await refreshCopilotTokenOn401()
+              if (refreshed) {
+                const newApiKey = process.env.OPENAI_API_KEY?.trim() || ''
+                if (newApiKey && newApiKey !== apiKey) {
+                  refreshedCopilotCodexToken = newApiKey
+                  continue
+                }
+              }
+            }
+          }
+          throw error
+        }
+      }
     }
 
     if (request.transport === 'codex_responses' && !isGithubMode) {
@@ -2049,6 +3056,7 @@ class OpenAIShimMessages {
       baseUrl: request.baseUrl,
       model: request.resolvedModel,
       treatAsLocal: isLocalProviderUrl(request.baseUrl),
+      preferBaseUrlRoute: Boolean(this.providerOverride),
     })
     const shimConfig = runtimeShimContext.openaiShimConfig
     // When endpointPath is overridden, the body format must match the target
@@ -2063,6 +3071,11 @@ class OpenAIShimMessages {
         : shimConfig.endpointPath?.startsWith('/models/gemini-')
           ? 'gemini'
           : request.transport
+    const useNativeOllamaChat =
+      effectiveTransport === 'chat_completions' &&
+      !shimConfig.endpointPath &&
+      isDirectLocalOllamaEndpoint(request.baseUrl) &&
+      isLikelyOllamaEndpoint(request.baseUrl)
     const openaiMessages = convertMessages(compressedMessages, params.system, {
       preserveReasoningContent: shimConfig.preserveReasoningContent,
       reasoningContentFallback: shimConfig.reasoningContentFallback,
@@ -2070,6 +3083,22 @@ class OpenAIShimMessages {
         request.resolvedModel,
         request.baseUrl,
       ),
+    })
+
+    const reasoningControl = resolveModelReasoningControl(request.resolvedModel, {
+      routeId: runtimeShimContext.routeId,
+      useRuntimeFallback: false,
+      openaiShimConfig: shimConfig,
+    })
+    const reasoningRequestPlan = resolveOpenAIShimReasoningRequestPlan({
+      model: request.resolvedModel,
+      requestedEffort: request.reasoning?.effort,
+      requestThinkingType: (params.thinking as { type?: string } | undefined)?.type,
+      defaultThinkingType: request.thinking?.type,
+      thinkingRequestFormat: shimConfig.thinkingRequestFormat,
+      routeId: runtimeShimContext.routeId,
+      useRuntimeFallback: false,
+      reasoningControl,
     })
 
     const body: Record<string, unknown> = {
@@ -2082,8 +3111,8 @@ class OpenAIShimMessages {
      // request carries a reasoning effort (set via /effort, model alias default,
      // or `?reasoning=<level>` query on the model string). OpenAI, Codex, and
      // most OpenAI-compatible endpoints read it from this top-level field.
-    if (request.reasoning) {
-      body.reasoning_effort = request.reasoning.effort
+    if (reasoningRequestPlan.wireFormat === 'reasoning_effort' && reasoningRequestPlan.reasoningEffort) {
+      body.reasoning_effort = reasoningRequestPlan.reasoningEffort
     }
     // Convert max_tokens to max_completion_tokens for OpenAI API compatibility.
     // Azure OpenAI requires max_completion_tokens and does not accept max_tokens.
@@ -2109,7 +3138,7 @@ class OpenAIShimMessages {
     const isLocal = isLocalProviderUrl(request.baseUrl)
 
     const githubEndpointType = getGithubEndpointType(request.baseUrl)
-    const isGithubCopilot = isGithub && githubEndpointType === 'copilot'
+    const isGithubCopilot = isGithub && (githubEndpointType === 'copilot' || githubEndpointType === 'ghe')
     const isGithubModels = isGithub && (githubEndpointType === 'models' || githubEndpointType === 'custom')
     const shouldStripResponsesStore =
       (shimConfig.removeBodyFields ?? []).includes('store') ||
@@ -2137,25 +3166,32 @@ class OpenAIShimMessages {
     if (params.temperature !== undefined) body.temperature = params.temperature
     if (params.top_p !== undefined) body.top_p = params.top_p
 
-    if (shimConfig.thinkingRequestFormat === 'deepseek-compatible') {
-      const requestedThinkingType = (params.thinking as { type?: string } | undefined)?.type
-      const deepSeekThinkingType =
-        requestedThinkingType === 'disabled'
-          ? 'disabled'
-          : requestedThinkingType === 'enabled' || requestedThinkingType === 'adaptive'
-            ? 'enabled'
-            : undefined
-
-      if (deepSeekThinkingType) {
-        body.thinking = { type: deepSeekThinkingType }
+    if (reasoningRequestPlan.wireFormat === 'deepseek_compatible') {
+      if (reasoningRequestPlan.thinkingType) {
+        body.thinking = { type: reasoningRequestPlan.thinkingType }
       }
-
-      if (deepSeekThinkingType === 'enabled') {
-        const effort = request.reasoning?.effort
-        if (effort) {
-          body.reasoning_effort = normalizeDeepSeekReasoningEffort(effort)
-        }
+      if (reasoningRequestPlan.reasoningEffort) {
+        body.reasoning_effort = reasoningRequestPlan.reasoningEffort
       }
+    }
+
+    if (reasoningRequestPlan.wireFormat === 'zai_compatible') {
+      if (reasoningRequestPlan.thinkingType) {
+        body.thinking = { type: reasoningRequestPlan.thinkingType }
+      }
+      if (reasoningRequestPlan.thinkingType === 'disabled') {
+        delete body.reasoning_effort
+      } else if (reasoningRequestPlan.reasoningEffort) {
+        body.reasoning_effort = reasoningRequestPlan.reasoningEffort
+      } else {
+        delete body.reasoning_effort
+      }
+    }
+
+    // Route/model strip rules are authoritative even when compatibility
+    // serializers add provider-specific reasoning fields later in the pipeline.
+    for (const field of shimConfig.removeBodyFields ?? []) {
+      delete body[field]
     }
 
     if (params.tools && params.tools.length > 0) {
@@ -2169,6 +3205,13 @@ class OpenAIShimMessages {
       )
       if (converted.length > 0) {
         body.tools = converted
+        if (
+          effectiveTransport === 'chat_completions' &&
+          params.stream &&
+          shimConfig.enableToolStreaming === true
+        ) {
+          body.tool_stream = true
+        }
         if (params.tool_choice) {
           const tc = params.tool_choice as { type?: string; name?: string }
           if (tc.type === 'auto') {
@@ -2197,6 +3240,7 @@ class OpenAIShimMessages {
             message?: { role?: string; content?: unknown }
             content?: unknown
           }>,
+          effectiveTransport === 'responses_compat',
         ),
         stream: params.stream ?? false,
         store: false,
@@ -2211,7 +3255,7 @@ class OpenAIShimMessages {
           {
             type: 'message',
             role: 'user',
-            content: [{ type: 'input_text', text: '' }],
+            content: [{ type: effectiveTransport === 'responses_compat' ? 'text' : 'input_text', text: '' }],
           },
         ]
       }
@@ -2229,6 +3273,13 @@ class OpenAIShimMessages {
 
       if (params.temperature !== undefined) responsesBody.temperature = params.temperature
       if (params.top_p !== undefined) responsesBody.top_p = params.top_p
+      if (reasoningRequestPlan.wireFormat === 'reasoning_effort' && reasoningRequestPlan.reasoningEffort) {
+        responsesBody.reasoning = {
+          effort: reasoningRequestPlan.reasoningEffort,
+          summary: 'auto',
+        }
+        responsesBody.include = ['reasoning.encrypted_content']
+      }
 
       if (!omitResponsesTools && params.tools && params.tools.length > 0) {
         const convertedTools = convertToolsToResponsesTools(
@@ -2277,6 +3328,31 @@ class OpenAIShimMessages {
       }
       if (params.tool_choice) {
         anthropicBody.tool_choice = params.tool_choice
+      }
+
+      if (request.reasoning?.effort) {
+        // Shim receives OpenAI effort levels (xhigh) from client.ts, but
+        // Anthropic API expects 'max' not 'xhigh'. Convert for the effort field.
+        const effort = request.reasoning.effort === 'xhigh' ? 'max' : request.reasoning.effort
+        const modelLower = request.resolvedModel.toLowerCase()
+        const isAdaptive = modelLower.includes('opus-4-7') || modelLower.includes('opus-4-6') ||
+          modelLower.includes('opus-4-8') ||
+          modelLower.includes('opus-4.6') || modelLower.includes('opus-4.7') ||
+          modelLower.includes('opus-4.8') ||
+          modelLower.includes('sonnet-4-6') || modelLower.includes('sonnet-4.6')
+        const isOpus45 = modelLower.includes('opus-4-5') || modelLower.includes('opus-4.5')
+
+        if (isAdaptive) {
+          anthropicBody.thinking = { type: 'adaptive' }
+          anthropicBody.effort = effort
+        } else if (isOpus45) {
+          anthropicBody.effort = effort
+        } else if (effort === 'high' || effort === 'max') {
+          anthropicBody.thinking = {
+            type: 'enabled',
+            budgetTokens: effort === 'max' ? 31_999 : 16_000,
+          }
+        }
       }
 
       return anthropicBody
@@ -2372,6 +3448,10 @@ class OpenAIShimMessages {
       }
       if (params.temperature !== undefined) genConfig.temperature = params.temperature
       if (params.top_p !== undefined) genConfig.topP = params.top_p
+      if (request.reasoning?.effort) {
+        const level = request.reasoning.effort === 'xhigh' ? 'high' : request.reasoning.effort
+        genConfig.thinkingConfig = { includeThoughts: true, thinkingLevel: level }
+      }
       if (Object.keys(genConfig).length > 0) {
         geminiBody.generationConfig = genConfig
       }
@@ -2395,7 +3475,7 @@ class OpenAIShimMessages {
       return geminiBody
     }
 
-    const headers: Record<string, string> = {
+    const baseHeaders: Record<string, string> = {
       'Content-Type': 'application/json',
       ...filterAnthropicHeaders(shimConfig.headers),
       ...this.defaultHeaders,
@@ -2413,36 +3493,119 @@ class OpenAIShimMessages {
     // sent as a Bearer to api.x.ai/v1 — same surface as an API key.
     const isXaiRoute =
       runtimeShimContext.routeId === 'xai' || isXaiBaseUrl(request.baseUrl)
+    const openAIApiKeysPoolRaw =
+      parseCredentialList(process.env.OPENAI_API_KEYS).length > 0
+        ? process.env.OPENAI_API_KEYS
+        : undefined
+    const openAIApiKeyRaw = process.env.OPENAI_API_KEY?.trim()
+    const openAIApiKeyValues = parseCredentialList(openAIApiKeyRaw)
+    const openAIApiKey = openAIApiKeyValues[0]
+    const openAIApiKeyRawUsable =
+      openAIApiKeyValues.length > 0 ? openAIApiKeyRaw : undefined
     const xaiOAuthToken =
       isXaiRoute &&
       !this.providerOverride?.apiKey &&
       !routeCredential &&
-      !process.env.OPENAI_API_KEY
+      !openAIApiKeysPoolRaw &&
+      !openAIApiKey
         ? await resolveXaiAccessToken()
         : undefined
-    const apiKey =
+    const openAIApiKeyIsCopiedProviderKey =
+      Boolean(
+        openAIApiKeyRawUsable &&
+        [
+          process.env.OPENGATEWAY_API_KEY,
+          process.env.NVIDIA_API_KEY,
+          process.env.BNKR_API_KEY,
+          process.env.XAI_API_KEY,
+          process.env.MIMO_API_KEY,
+          process.env.VENICE_API_KEY,
+          process.env.MINIMAX_API_KEY,
+          process.env.ATLAS_CLOUD_API_KEY,
+          process.env.NEARAI_API_KEY,
+          process.env.FIREWORKS_API_KEY,
+        ].some(value => value?.trim() === openAIApiKeyRawUsable),
+      )
+    const routeCredentialIsCopiedProviderKey =
+      Boolean(
+        routeCredential &&
+        openAIApiKeyRawUsable &&
+        routeCredential === openAIApiKeyRawUsable &&
+        openAIApiKeyIsCopiedProviderKey,
+      )
+    const routeCredentialIsProviderSpecific =
+      Boolean(
+        routeCredential &&
+        (!openAIApiKeyRawUsable ||
+          routeCredential !== openAIApiKeyRawUsable ||
+          routeCredentialIsCopiedProviderKey),
+      )
+    const routeCredentialIsGenericOpenAIFallback =
+      Boolean(
+        !routeCredentialIsProviderSpecific &&
+        routeCredential &&
+        openAIApiKeyRawUsable &&
+        routeCredential === openAIApiKeyRawUsable,
+      )
+    const apiKeyRaw =
       this.providerOverride?.apiKey ??
+      (openAIApiKeyIsCopiedProviderKey ? openAIApiKeyRawUsable : undefined) ??
+      (routeCredentialIsGenericOpenAIFallback ? undefined : routeCredential) ??
+      openAIApiKeysPoolRaw ??
       routeCredential ??
-      process.env.OPENAI_API_KEY ??
-      xaiOAuthToken ??
-      ''
-    const configuredAuthHeaderValue = process.env.OPENAI_AUTH_HEADER_VALUE?.trim()
-    const customAuthHeader = process.env.OPENAI_AUTH_HEADER?.trim()
+      (openAIApiKeyRawUsable || xaiOAuthToken || '')
+    // A catalog-level auth header is part of the selected model's transport
+    // contract. Ignore global custom auth left behind by another route so it
+    // cannot replace that model-specific header or credential.
+    const catalogAuthHeader =
+      runtimeShimContext.catalogEntry?.transportOverrides?.openaiShim
+        ?.defaultAuthHeader
+    const configuredAuthHeaderValue = catalogAuthHeader
+      ? undefined
+      : process.env.OPENAI_AUTH_HEADER_VALUE?.trim()
+    if (configuredAuthHeaderValue && /[\r\n]/.test(configuredAuthHeaderValue)) {
+      throw new Error('OPENAI_AUTH_HEADER_VALUE must not contain CR/LF characters')
+    }
+    const customAuthHeader = catalogAuthHeader
+      ? undefined
+      : process.env.OPENAI_AUTH_HEADER?.trim()
     const hasCustomAuthHeader = Boolean(
       customAuthHeader &&
       /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(customAuthHeader),
     )
-    const authValue = hasCustomAuthHeader
-      ? configuredAuthHeaderValue || apiKey
-      : apiKey
+    const explicitCustomAuthHeaderValue = hasCustomAuthHeader
+      ? configuredAuthHeaderValue
+      : ''
+    if (!explicitCustomAuthHeaderValue && hasInvalidCredentialPlaceholder(apiKeyRaw)) {
+      throw APIError.generate(
+        401,
+        undefined,
+        buildOpenAICompatibilityErrorMessage(
+          'OpenAI API error 401: invalid credential pool placeholder SUA_CHAVE detected',
+          {
+            category: 'auth_invalid',
+            requestUrl: request.baseUrl,
+          },
+        ),
+        new Headers(),
+      )
+    }
     // Detect Azure endpoints by hostname (not raw URL) to prevent bypass via
     // path segments like https://evil.com/cognitiveservices.azure.com/
-    let isAzure = false
-    try {
-      const { hostname } = new URL(request.baseUrl)
-      isAzure = hostname.endsWith('.azure.com') &&
-        (hostname.includes('cognitiveservices') || hostname.includes('openai') || hostname.includes('services.ai'))
-    } catch { /* malformed URL — not Azure */ }
+    let isAzure = isEnvTruthy(process.env.OPENAI_AZURE_STYLE)
+    if (!isAzure) {
+      try {
+        const { hostname } = new URL(request.baseUrl)
+        isAzure =
+          hostname.endsWith('.azure.com') &&
+          (hostname.includes('cognitiveservices') ||
+            hostname.includes('openai') ||
+            hostname.includes('services.ai') ||
+            hostname.includes('inference.ml'))
+      } catch {
+        /* malformed URL — not Azure */
+      }
+    }
 
     let isBankr = false
     try {
@@ -2451,56 +3614,75 @@ class OpenAIShimMessages {
         request.baseUrl.toLowerCase().includes('bankr')
     } catch { /* malformed URL — not Bankr */ }
 
-    if (authValue) {
-      if (hasCustomAuthHeader && customAuthHeader) {
-        const defaultCustomAuthScheme =
-          customAuthHeader.toLowerCase() === 'authorization' ? 'bearer' : 'raw'
-        const customAuthScheme =
-          process.env.OPENAI_AUTH_SCHEME === 'raw' ||
-          process.env.OPENAI_AUTH_SCHEME === 'bearer'
-            ? process.env.OPENAI_AUTH_SCHEME
-            : defaultCustomAuthScheme
-        headers[customAuthHeader] =
-          customAuthScheme === 'bearer'
-            ? `Bearer ${authValue}`
-            : authValue
-      } else if (isAzure) {
-        // Azure uses api-key header instead of Bearer token
-        headers['api-key'] = authValue
-      } else if (isBankr) {
-        // Bankr uses X-API-Key header instead of Bearer token
-        headers['X-API-Key'] = authValue
-      } else if (shimConfig.defaultAuthHeader?.name) {
-        headers[shimConfig.defaultAuthHeader.name] =
-          shimConfig.defaultAuthHeader.scheme === 'bearer'
-            ? `Bearer ${authValue}`
-            : authValue
-      } else {
-        headers.Authorization = `Bearer ${authValue}`
-      }
-    } else if (isGemini) {
-      const geminiCredential = await resolveGeminiCredential(process.env)
-      if (geminiCredential.kind !== 'none') {
-        headers.Authorization = `Bearer ${geminiCredential.credential}`
-        if (geminiCredential.kind !== 'api-key' && 'projectId' in geminiCredential && geminiCredential.projectId) {
-          headers['x-goog-user-project'] = geminiCredential.projectId
+    const credentialPool = explicitCustomAuthHeaderValue
+      ? null
+      : this.getCredentialPool(apiKeyRaw)
+    const singleAuthValue =
+      explicitCustomAuthHeaderValue || parseCredentialList(apiKeyRaw)[0] || apiKeyRaw
+
+    const buildHeadersForAttempt = async (
+      credentialLease: CredentialLease | null,
+    ): Promise<Record<string, string>> => {
+      const headers: Record<string, string> = { ...baseHeaders }
+      const authValue =
+        explicitCustomAuthHeaderValue ||
+        refreshedCopilotToken ||
+        credentialLease?.value ||
+        (credentialPool ? '' : singleAuthValue)
+
+      if (authValue) {
+        if (hasCustomAuthHeader && customAuthHeader) {
+          const defaultCustomAuthScheme =
+            customAuthHeader.toLowerCase() === 'authorization' ? 'bearer' : 'raw'
+          const customAuthScheme =
+            process.env.OPENAI_AUTH_SCHEME === 'raw' ||
+            process.env.OPENAI_AUTH_SCHEME === 'bearer'
+              ? process.env.OPENAI_AUTH_SCHEME
+              : defaultCustomAuthScheme
+          headers[customAuthHeader] =
+            customAuthScheme === 'bearer'
+              ? `Bearer ${authValue}`
+              : authValue
+        } else if (isAzure) {
+          // Azure uses api-key header instead of Bearer token
+          headers['api-key'] = authValue
+        } else if (isBankr) {
+          // Bankr uses X-API-Key header instead of Bearer token
+          headers['X-API-Key'] = authValue
+        } else if (shimConfig.defaultAuthHeader?.name) {
+          headers[shimConfig.defaultAuthHeader.name] =
+            shimConfig.defaultAuthHeader.scheme === 'bearer'
+              ? `Bearer ${authValue}`
+              : authValue
+        } else {
+          headers.Authorization = `Bearer ${authValue}`
+        }
+      } else if (isGemini) {
+        const geminiCredential = await resolveGeminiCredential(process.env)
+        if (geminiCredential.kind !== 'none') {
+          headers.Authorization = `Bearer ${geminiCredential.credential}`
+          if (geminiCredential.kind !== 'api-key' && 'projectId' in geminiCredential && geminiCredential.projectId) {
+            headers['x-goog-user-project'] = geminiCredential.projectId
+          }
         }
       }
-    }
 
-    if (isGithubCopilot) {
-      Object.assign(headers, COPILOT_HEADERS)
-    } else if (isGithubModels) {
-      headers['Accept'] = 'application/vnd.github+json'
-      headers['X-GitHub-Api-Version'] = '2022-11-28'
-    }
+      if (isGithubCopilot) {
+        Object.assign(headers, COPILOT_HEADERS)
+      } else if (isGithubModels) {
+        headers['Accept'] = 'application/vnd.github+json'
+        headers['X-GitHub-Api-Version'] = '2022-11-28'
+      }
 
-    // xAI / Grok prompt caching. Pinning the session id via x-grok-conv-id
-    // routes follow-up requests to the same backend so xAI can reuse the
-    // cached system prompt and conversation history. Mirrors the Hermes
-    // implementation (RELEASE_v0.8.0 PR #5604).
-    if (isXaiRoute) {
-      headers['x-grok-conv-id'] ??= getSessionId()
+      // xAI / Grok prompt caching. Pinning the session id via x-grok-conv-id
+      // routes follow-up requests to the same backend so xAI can reuse the
+      // cached system prompt and conversation history. Mirrors the Hermes
+      // implementation (RELEASE_v0.8.0 PR #5604).
+      if (isXaiRoute) {
+        headers['x-grok-conv-id'] ??= getSessionId()
+      }
+
+      return headers
     }
 
     const buildChatCompletionsUrl = (baseUrl: string): string => {
@@ -2508,7 +3690,7 @@ class OpenAIShimMessages {
       // path and an api-version query parameter.
       if (isAzure) {
         const apiVersion = process.env.AZURE_OPENAI_API_VERSION ?? '2024-12-01-preview'
-        const deployment = request.resolvedModel ?? process.env.OPENAI_MODEL ?? 'gpt-4o'
+        const deployment = encodeURIComponent(request.resolvedModel ?? process.env.OPENAI_MODEL ?? 'gpt-4o')
 
         // If base URL already contains /deployments/, use it as-is with api-version.
         if (/\/deployments\//i.test(baseUrl)) {
@@ -2535,7 +3717,10 @@ class OpenAIShimMessages {
       if (shimConfig.endpointPath) {
         return `${baseUrl}${shimConfig.endpointPath}`
       }
-      return request.transport === 'responses'
+      if (useNativeOllamaChat) {
+        return buildOllamaChatUrl(baseUrl)
+      }
+      return request.transport === 'responses' || request.transport === 'responses_compat'
         ? `${baseUrl}/responses`
         : buildChatCompletionsUrl(baseUrl)
     }
@@ -2544,6 +3729,8 @@ class OpenAIShimMessages {
     let requestUrl = buildRequestUrl(activeBaseUrl)
     const attemptedLocalBaseUrls = new Set<string>([activeBaseUrl])
     let didRetryWithoutTools = false
+    let didRefreshCopilotToken = false
+    let refreshedCopilotToken: string | undefined
 
     const promoteNextLocalBaseUrl = (
       reason: 'endpoint_not_found' | 'localhost_resolution_failed',
@@ -2569,6 +3756,25 @@ class OpenAIShimMessages {
       return false
     }
 
+    const bodyContainsImages = (): boolean => {
+      if (request.transport === 'responses') {
+        const responsesBody = buildResponsesBody()
+        const input = responsesBody.input as Array<Record<string, unknown>> | undefined
+        if (!Array.isArray(input)) return false
+        return input.some(item => {
+          const content = item.content as Array<Record<string, unknown>> | undefined
+          return Array.isArray(content) && content.some(part => part.type === 'input_image')
+        })
+      }
+      const messages = body.messages as Array<Record<string, unknown>> | undefined
+      if (!Array.isArray(messages)) return false
+      return messages.some(msg => {
+        const content = msg.content
+        if (!Array.isArray(content)) return false
+        return content.some((part: Record<string, unknown>) => part.type === 'image_url')
+      })
+    }
+
     // WHY: byte-identity required for implicit prefix caching in
     // OpenAI/Kimi/DeepSeek. stableStringify sorts object keys at every
     // depth so spurious insertion-order differences across rebuilds of
@@ -2578,9 +3784,31 @@ class OpenAIShimMessages {
     // Local backends do not implement prefix caching, so the deep key-sort
     // is pure CPU overhead per request (issue #1016). Drop to the native
     // `JSON.stringify` fast path when the fast-path config opts out.
+    const buildOllamaChatBody = (): Record<string, unknown> => {
+      const options: Record<string, unknown> = {
+        num_ctx: getOllamaNumCtx(),
+      }
+      if (body.max_tokens !== undefined) {
+        options.num_predict = body.max_tokens
+      } else if (body.max_completion_tokens !== undefined) {
+        options.num_predict = body.max_completion_tokens
+      }
+      if (params.temperature !== undefined) options.temperature = params.temperature
+      if (params.top_p !== undefined) options.top_p = params.top_p
+
+      return {
+        model: request.resolvedModel,
+        messages: normalizeOllamaNativeMessages(body.messages),
+        stream: params.stream ?? false,
+        options,
+        ...(body.tools ? { tools: body.tools } : {}),
+      }
+    }
+
     const serializeBody = (): string => {
       const payload =
-        effectiveTransport === 'responses' ? buildResponsesBody()
+        useNativeOllamaChat ? buildOllamaChatBody()
+          : effectiveTransport === 'responses' || effectiveTransport === 'responses_compat' ? buildResponsesBody()
           : effectiveTransport === 'anthropic_messages' ? buildAnthropicMessagesBody()
           : effectiveTransport === 'gemini' ? buildGeminiBody()
           : body
@@ -2594,7 +3822,7 @@ class OpenAIShimMessages {
       serializedBody = serializeBody()
     }
 
-    const buildFetchInit = () => ({
+    const buildFetchInit = (headers: Record<string, string>) => ({
       method: 'POST' as const,
       headers,
       body: serializedBody,
@@ -2604,7 +3832,10 @@ class OpenAIShimMessages {
     const maxSelfHealAttempts = isLocal
       ? localRetryBaseUrls.length + 1
       : 0
-    const maxAttempts = (isGithub ? GITHUB_429_MAX_RETRIES : 1) + maxSelfHealAttempts
+    const credentialPoolAttempts = credentialPool?.size ?? 1
+    const maxAttempts =
+      Math.max(isGithub ? GITHUB_429_MAX_RETRIES : 1, credentialPoolAttempts) +
+      maxSelfHealAttempts
 
     const throwClassifiedTransportError = (
       error: unknown,
@@ -2658,6 +3889,7 @@ class OpenAIShimMessages {
           status,
           body: errorBody,
           url: requestUrl,
+          hasImages: bodyContainsImages(),
         })
       const failureWithUrl = { ...failure, requestUrl: failure.requestUrl ?? requestUrl }
       const redactedUrl = redactUrlForDiagnostics(requestUrl)
@@ -2687,10 +3919,26 @@ class OpenAIShimMessages {
       : 'openai'
     const { correlationId, startTime } = logApiCallStart(provider, request.resolvedModel)
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const credentialLease = credentialPool?.next() ?? null
+      if (credentialPool && !credentialLease) {
+        throw APIError.generate(
+          401,
+          undefined,
+          buildOpenAICompatibilityErrorMessage(
+            'OpenAI API error 401: credential pool exhausted after authentication failures',
+            {
+              category: 'auth_invalid',
+              requestUrl,
+            },
+          ),
+          new Headers(),
+        )
+      }
+      const headers = await buildHeadersForAttempt(credentialLease)
       try {
         response = await fetchWithProxyRetry(
           requestUrl,
-          buildFetchInit(),
+          buildFetchInit(headers),
         )
       } catch (error) {
         const isAbortError =
@@ -2722,7 +3970,17 @@ class OpenAIShimMessages {
         throwClassifiedTransportError(error, requestUrl, failure)
       }
 
+      // After the try/catch, response is guaranteed to be defined — the catch
+      // block always throws (throwClassifiedTransportError returns never).
+      if (!response) continue
+
       if (response.ok) {
+        credentialPool?.reportSuccess(credentialLease)
+        if (useNativeOllamaChat) {
+          response = params.stream
+            ? convertOllamaStreamingResponse(response, request.resolvedModel)
+            : await convertOllamaNonStreamingResponse(response, request.resolvedModel)
+        }
         let tokensIn = 0
         let tokensOut = 0
         // Skip clone() for streaming responses - it blocks until full body is received,
@@ -2730,11 +3988,48 @@ class OpenAIShimMessages {
         // stream_options: { include_usage: true } and can be extracted from the stream.
         if (!params.stream) {
           try {
-            const clone = response.clone()
-            const data = await clone.json()
+            const bodyText = await response.text()
+            // Preserve routing metadata that `new Response()` drops to "".
+            // create() reads `response.url` to route between /responses,
+            // /messages, and Gemini conversion paths; losing it makes
+            // descriptor routes (OpenCode /messages, Gemini /models/gemini-*)
+            // fall through to the generic OpenAI converter and return the
+            // wrong message shape. `url` is a read-only getter on the
+            // prototype, so shadow it with an own property.
+            const originalUrl = response.url
+            const originalType = response.type
+            // Recreate the response immediately after reading the body, before
+            // JSON.parse — if parsing fails, downstream code can still read the
+            // body from the fresh Response instead of hitting "Body already used".
+            response = new Response(bodyText, {
+              status: response.status,
+              statusText: response.statusText,
+              headers: response.headers,
+            })
+            if (originalUrl) {
+              try {
+                Object.defineProperty(response, 'url', {
+                  value: originalUrl,
+                  configurable: true,
+                })
+              } catch {
+                /* some runtimes lock the property; routing falls back to transport */
+              }
+            }
+            if (originalType && originalType !== 'basic') {
+              try {
+                Object.defineProperty(response, 'type', {
+                  value: originalType,
+                  configurable: true,
+                })
+              } catch {
+                /* non-fatal: type is not used for response routing */
+              }
+            }
+            const data = JSON.parse(bodyText)
             tokensIn = data.usage?.prompt_tokens ?? 0
             tokensOut = data.usage?.completion_tokens ?? 0
-          } catch { /* ignore */ }
+          } catch { /* ignore — response is already recreated with the body intact */ }
         }
         logApiCallEnd(correlationId, startTime, request.resolvedModel, 'success', tokensIn, tokensOut, false)
         return response
@@ -2766,7 +4061,7 @@ class OpenAIShimMessages {
           const responsesUrl = `${request.baseUrl}/responses`
           const responsesBody = buildResponsesBody()
 
-          let responsesResponse: Response
+          let responsesResponse!: Response
           try {
             responsesResponse = await fetchWithProxyRetry(responsesUrl, {
               method: 'POST',
@@ -2785,6 +4080,7 @@ class OpenAIShimMessages {
           const responsesFailure = classifyOpenAIHttpFailure({
             status: responsesResponse.status,
             body: responsesErrorBody,
+            hasImages: bodyContainsImages(),
           })
           let responsesErrorResponse: object | undefined
           try { responsesErrorResponse = JSON.parse(responsesErrorBody) } catch { /* raw text */ }
@@ -2803,7 +4099,55 @@ class OpenAIShimMessages {
       const failure = classifyOpenAIHttpFailure({
         status: response.status,
         body: errorBody,
+        hasImages: bodyContainsImages(),
       })
+
+      // GitHub Copilot 401 with expired token: force-refresh and retry once.
+      // Only applies to the Copilot endpoint, not GitHub Models API or custom
+      // routes, and only when the failing credential is the stored Copilot
+      // token (not a provider override, route credential, or custom auth).
+      // The refreshed token is stored in refreshedCopilotToken so the next
+      // iteration's buildHeadersForAttempt picks it up instead of the stale
+      // singleAuthValue captured before the loop.
+      if (isGithubCopilot && response.status === 401 && !didRefreshCopilotToken) {
+        if (isCopilotTokenExpiredError(errorBody)) {
+          const oldToken = headers.Authorization?.replace(/^Bearer\s+/i, '') || ''
+          if (oldToken && oldToken === (process.env.OPENAI_API_KEY ?? '')) {
+            didRefreshCopilotToken = true
+            const refreshed = await refreshCopilotTokenOn401()
+            if (refreshed) {
+              const newApiKey = process.env.OPENAI_API_KEY?.trim() || ''
+              if (newApiKey && newApiKey !== oldToken) {
+                refreshedCopilotToken = newApiKey
+              }
+              if (attempt < maxAttempts - 1) {
+                continue
+              }
+            }
+          }
+        }
+      }
+
+      const credentialFailureKind =
+        failure.category === 'auth_invalid' && !failure.retryable
+          ? 'auth'
+          : response.status === 402 || response.status === 429
+            ? 'cooldown'
+            : null
+      if (credentialPool && credentialPool.size > 1 && credentialFailureKind) {
+        credentialPool.reportFailure(
+          credentialLease,
+          credentialFailureKind,
+          CREDENTIAL_POOL_COOLDOWN_MS,
+        )
+        if (attempt < maxAttempts - 1) {
+          logForDebugging(
+            `[OpenAIShim] credential pool retry status=${response.status} method=POST url=${redactUrlForDiagnostics(requestUrl)} model=${request.resolvedModel}`,
+            { level: 'warn' },
+          )
+          continue
+        }
+      }
 
       if (
         isLocal &&
@@ -2814,7 +4158,7 @@ class OpenAIShimMessages {
       }
 
       const hasToolsPayload =
-        effectiveTransport === 'responses' || effectiveTransport === 'anthropic_messages' || effectiveTransport === 'gemini'
+        effectiveTransport === 'responses' || effectiveTransport === 'responses_compat' || effectiveTransport === 'anthropic_messages' || effectiveTransport === 'gemini'
           ? Array.isArray(params.tools) && params.tools.length > 0
           : Array.isArray(body.tools) && body.tools.length > 0
 
@@ -2829,6 +4173,7 @@ class OpenAIShimMessages {
         didRetryWithoutTools = true
         delete body.tools
         delete body.tool_choice
+        delete body.tool_stream
         omitResponsesTools = true
         omitAnthropicTools = true
         omitGeminiTools = true
@@ -2894,6 +4239,43 @@ class OpenAIShimMessages {
     const choice = data.choices?.[0]
     const content: Array<Record<string, unknown>> = []
 
+    // Recover tool calls that the model emitted as text (no structured
+    // tool_calls field): first the "Tool calls requested:" prefix format, then
+    // XML dialects (GLM/Qwen `<tool_call>…`). Falls back to plain text.
+    const pushParsedTextContent = (strippedContent: string) => {
+      if (choice?.message?.tool_calls) {
+        content.push({ type: 'text', text: strippedContent })
+        return
+      }
+      const rawToolCalls = parseRawToolCallsRequestedText(strippedContent)
+      if (rawToolCalls) {
+        for (const toolCall of rawToolCalls) {
+          content.push({
+            type: 'tool_use',
+            id: toolCall.id,
+            name: toolCall.name,
+            input: JSON.parse(toolCall.argumentsJson),
+          })
+        }
+        return
+      }
+      const { calls, toolCallRanges } = parseXmlToolCalls(strippedContent)
+      if (calls.length > 0) {
+        const remaining = stripRanges(strippedContent, toolCallRanges).trim()
+        if (remaining) content.push({ type: 'text', text: remaining })
+        for (const tc of calls) {
+          content.push({
+            type: 'tool_use',
+            id: tc.id,
+            name: tc.name,
+            input: tc.arguments,
+          })
+        }
+        return
+      }
+      content.push({ type: 'text', text: strippedContent })
+    }
+
     // Some reasoning models (e.g. GLM-5) put their chain-of-thought in
     // reasoning_content while content stays null. Preserve it as a thinking
     // block, but do not surface it as visible assistant text.
@@ -2906,25 +4288,7 @@ class OpenAIShimMessages {
         ? choice?.message?.content
         : null
     if (typeof rawContent === 'string' && rawContent) {
-      const strippedContent = stripThinkTags(rawContent)
-      const rawToolCalls = choice?.message?.tool_calls
-        ? null
-        : parseRawToolCallsRequestedText(strippedContent)
-      if (rawToolCalls) {
-        for (const toolCall of rawToolCalls) {
-          content.push({
-            type: 'tool_use',
-            id: toolCall.id,
-            name: toolCall.name,
-            input: JSON.parse(toolCall.argumentsJson),
-          })
-        }
-      } else {
-        content.push({
-          type: 'text',
-          text: strippedContent,
-        })
-      }
+      pushParsedTextContent(stripThinkTags(rawContent))
     } else if (Array.isArray(rawContent) && rawContent.length > 0) {
       const parts: string[] = []
       for (const part of rawContent) {
@@ -2939,25 +4303,7 @@ class OpenAIShimMessages {
       }
       const joined = parts.join('\n')
       if (joined) {
-        const strippedContent = stripThinkTags(joined)
-        const rawToolCalls = choice?.message?.tool_calls
-          ? null
-          : parseRawToolCallsRequestedText(strippedContent)
-        if (rawToolCalls) {
-          for (const toolCall of rawToolCalls) {
-            content.push({
-              type: 'tool_use',
-              id: toolCall.id,
-              name: toolCall.name,
-              input: JSON.parse(toolCall.argumentsJson),
-            })
-          }
-        } else {
-          content.push({
-            type: 'text',
-            text: strippedContent,
-          })
-        }
+        pushParsedTextContent(stripThinkTags(joined))
       }
     }
 
@@ -3100,3 +4446,6 @@ export function createOpenAIShimClient(options: {
     messages: beta.messages,
   }
 }
+
+// Test-only surface (same pattern as WebSearchTool's __test export).
+export const __test = { convertMessages }

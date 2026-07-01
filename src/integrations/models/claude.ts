@@ -2,24 +2,6 @@ import { defineModel } from '../define.js'
 
 export default [
   defineModel({
-    id: 'claude-sonnet-4-6',
-    label: 'Claude Sonnet 4.6',
-    brandId: 'claude',
-    vendorId: 'anthropic',
-    classification: ['chat', 'reasoning', 'vision', 'coding'],
-    defaultModel: 'claude-sonnet-4-6',
-    capabilities: {
-      supportsVision: true,
-      supportsStreaming: true,
-      supportsFunctionCalling: true,
-      supportsJsonMode: true,
-      supportsReasoning: true,
-      supportsPreciseTokenCount: false,
-    },
-    contextWindow: 200_000,
-    maxOutputTokens: 8192,
-  }),
-  defineModel({
     id: 'claude-opus-4-8',
     label: 'Claude Opus 4.8',
     brandId: 'claude',
@@ -35,6 +17,24 @@ export default [
       supportsPreciseTokenCount: false,
     },
     contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+  }),
+  defineModel({
+    id: 'claude-sonnet-4-6',
+    label: 'Claude Sonnet 4.6',
+    brandId: 'claude',
+    vendorId: 'anthropic',
+    classification: ['chat', 'reasoning', 'vision', 'coding'],
+    defaultModel: 'claude-sonnet-4-6',
+    capabilities: {
+      supportsVision: true,
+      supportsStreaming: true,
+      supportsFunctionCalling: true,
+      supportsJsonMode: true,
+      supportsReasoning: true,
+      supportsPreciseTokenCount: false,
+    },
+    contextWindow: 200_000,
     maxOutputTokens: 8192,
   }),
   defineModel({

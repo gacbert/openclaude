@@ -37,6 +37,7 @@ import { SETTING_SOURCES, type SettingSource } from '../settings/constants.js'
 import { getManagedSettingsDropInDir } from '../settings/managedPath.js'
 import {
   getInitialSettings,
+  getRelativeSettingsFilePathForSource,
   getSettings_DEPRECATED,
   getSettingsFilePathForSource,
   getSettingsForSource,
@@ -145,6 +146,15 @@ export function resolveSandboxFilesystemPath(
   return expandPath(pattern, getSettingsRootPathForSource(source))
 }
 
+function getCurrentCwdSettingsDenyWritePaths(cwd: string): string[] {
+  return [
+    resolve(cwd, '.claude', 'settings.json'),
+    resolve(cwd, '.claude', 'settings.local.json'),
+    resolve(cwd, getRelativeSettingsFilePathForSource('projectSettings')),
+    resolve(cwd, getRelativeSettingsFilePathForSource('localSettings')),
+  ]
+}
+
 /**
  * Check if only managed sandbox domains should be used.
  * This is true when policySettings has sandbox.network.allowManagedDomainsOnly: true
@@ -240,8 +250,7 @@ export function convertToSandboxRuntimeConfig(
   const cwd = getCwdState()
   const originalCwd = getOriginalCwd()
   if (cwd !== originalCwd) {
-    denyWrite.push(resolve(cwd, '.claude', 'settings.json'))
-    denyWrite.push(resolve(cwd, '.claude', 'settings.local.json'))
+    denyWrite.push(...getCurrentCwdSettingsDenyWritePaths(cwd))
   }
 
   // Block writes to .claude/skills in both original and current working directories.
@@ -968,7 +977,8 @@ export const SandboxManager: ISandboxManager = {
   waitForNetworkInitialization: BaseSandboxManager.waitForNetworkInitialization,
   getSandboxViolationStore: BaseSandboxManager.getSandboxViolationStore,
   annotateStderrWithSandboxFailures:
-    BaseSandboxManager.annotateStderrWithSandboxFailures,
+    BaseSandboxManager.annotateStderrWithSandboxFailures ??
+    ((_command: string, stderr: string): string => stderr),
   cleanupAfterCommand: (): void => {
     BaseSandboxManager.cleanupAfterCommand()
     scrubBareGitRepoFiles()
