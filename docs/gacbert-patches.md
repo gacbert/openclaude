@@ -72,3 +72,33 @@ Expected:
 - `gpt-5.4` reports both `system.init.model` and assistant usage as `gpt-5.4`.
 - `gpt-5.5` reports both `system.init.model` and assistant usage as `gpt-5.5`.
 - `gpt-5.5` context remains around `272000`.
+
+## v0.21.0 merge (2026-07-01)
+
+Merged upstream `v0.21.0` (from 0.15.0 base). Per-patch status after the merge:
+
+- **ABSORBED upstream** (no longer fork-only; keep no local delta):
+  - Spark streamed tool-call arguments — upstream `codexShim.ts` now carries
+    the same recovery logic verbatim (upstream #1259).
+  - Opus 4.8 catalog/alias — upstream added `opus48` config, catalog entry
+    (with a better 128k max-output), `getDefaultOpusModel()` default, and
+    labels (upstream #1769). The fork's duplicate lower-output
+    `claude-opus-4-8` catalog entry was removed during conflict resolution.
+- **STILL FORK-ONLY** (re-verified in the merged build by the post-build
+  guard):
+  - Headless requested-model routing (`main.tsx` seeding).
+  - Codex request identity (`codex_cli_rs` originator/User-Agent in shim,
+    usage, web search, cache probe).
+  - Spark catalog metadata in `integrations/models/gpt.ts` (upstream still
+    has no first-party spark entry).
+  - Opus 4.8 default-1M context accounting (`modelUsesDefault1MContext` in
+    `utils/context.ts`) — upstream still gates 1M behind the `[1m]` suffix /
+    beta header.
+  - Codex Fast tier (`OPENCLAUDE_CODEX_SERVICE_TIER` → `service_tier:
+    "priority"`).
+- **Guard script**: needles converted to whitespace-tolerant regexes — the
+  0.21.0 build minifies assignment/property spacing, which the old literal
+  strings predated. Same assertions, format-proof.
+- Fable note: upstream supports `claude-fable-5` only via the opencode
+  gateway; the first-party route still needs the bot-side
+  `claude-fable-5[1m]` alias for the 1M window.
