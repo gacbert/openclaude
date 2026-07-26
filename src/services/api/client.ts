@@ -13,10 +13,11 @@ import {
   convertEffortValueToLevel,
   type EffortValue,
   resolveAppliedEffort,
+  resolveModelReasoningControl,
   modelSupportsShimReasoningEffort,
   modelSupportsWireEffort,
   standardEffortToOpenAI,
-  type OpenAIEffortLevel,
+  type OpenAIShimEffortLevel,
 } from 'src/utils/effort.js'
 import { getUserAgent } from 'src/utils/http.js'
 import { getSmallFastModel } from 'src/utils/model/model.js'
@@ -39,6 +40,7 @@ import {
 } from '../../utils/envUtils.js'
 import {
   getFireworksBaseUrlOverride,
+  getLongcatBaseUrlOverride,
   getMiniMaxBaseUrlOverride,
   getNearaiBaseUrlOverride,
   getRouteDefaultBaseUrl,
@@ -49,15 +51,23 @@ import {
 } from '../../integrations/routeMetadata.js'
 import { resolveOpenAIShimRuntimeContext } from '../../integrations/runtimeMetadata.js'
 import {
-  shouldUseFirstPartyAnthropicAuth,
+  shouldUseCustomAnthropicBearerAuth,
+  shouldUseFirstPartyAnthropicAuthForProvider,
   type ProviderOverride,
 } from './authRouting.js'
 import { AnthropicVertex } from './vertexClient.js'
+import { importOptionalRuntimeModule } from '../../utils/optionalRuntimeModule.js'
 
-const importRuntimeModule = new Function(
-  'specifier',
-  'return import(specifier)',
-) as (specifier: string) => Promise<any>
+type OptionalRuntimeImporter = typeof importOptionalRuntimeModule
+
+let importOptionalRuntimeModuleForClient: OptionalRuntimeImporter =
+  importOptionalRuntimeModule
+
+export function _setOptionalRuntimeModuleImporterForTesting(
+  importer?: OptionalRuntimeImporter,
+): void {
+  importOptionalRuntimeModuleForClient = importer ?? importOptionalRuntimeModule
+}
 
 /**
  * Environment variables for different client types:
@@ -190,6 +200,7 @@ function applyMiniMaxEnvOnlyDefaults(model: string | undefined): void {
     getRouteDefaultModel('minimax')
   delete process.env.CLAUDE_CODE_USE_OPENAI
   delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
   delete process.env.OPENAI_AUTH_HEADER
   delete process.env.OPENAI_AUTH_SCHEME
   delete process.env.OPENAI_AUTH_HEADER_VALUE
@@ -218,6 +229,7 @@ function applyXiaomiMimoEnvOnlyDefaults(): void {
     getRouteDefaultModel('xiaomi-mimo')
   process.env.OPENAI_API_KEY = process.env.MIMO_API_KEY
   delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
   delete process.env.OPENAI_AUTH_HEADER
   delete process.env.OPENAI_AUTH_SCHEME
   delete process.env.OPENAI_AUTH_HEADER_VALUE
@@ -238,6 +250,7 @@ function applyXaiEnvOnlyDefaults(): void {
     getRouteDefaultModel('xai')
   process.env.OPENAI_API_KEY = process.env.XAI_API_KEY
   delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
   delete process.env.OPENAI_AUTH_HEADER
   delete process.env.OPENAI_AUTH_SCHEME
   delete process.env.OPENAI_AUTH_HEADER_VALUE
@@ -273,6 +286,7 @@ function applyNearaiEnvOnlyDefaults(): void {
     getRouteDefaultModel('nearai')
   process.env.OPENAI_API_KEY = process.env.NEARAI_API_KEY
   delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
   delete process.env.OPENAI_AUTH_HEADER
   delete process.env.OPENAI_AUTH_SCHEME
   delete process.env.OPENAI_AUTH_HEADER_VALUE
@@ -309,6 +323,52 @@ function applyFireworksEnvOnlyDefaults(): void {
     getRouteDefaultModel('fireworks')
   process.env.OPENAI_API_KEY = process.env.FIREWORKS_API_KEY
   delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+}
+
+function isLongcatModelName(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase()
+  return Boolean(normalized && normalized.startsWith('longcat'))
+}
+
+function applyLongcatEnvOnlyDefaults(): void {
+  const baseUrlOverride = getLongcatBaseUrlOverride()
+  const hasLongcatBaseOverride = baseUrlOverride !== undefined
+  const modelOverride = process.env.OPENAI_MODEL?.trim() || undefined
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('longcat')
+  process.env.OPENAI_MODEL =
+    (hasLongcatBaseOverride || isLongcatModelName(modelOverride)
+      ? modelOverride
+      : undefined) ??
+    getRouteDefaultModel('longcat')
+  process.env.OPENAI_API_KEY = process.env.LONGCAT_API_KEY
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+}
+
+function applyAimlapiEnvOnlyDefaults(): void {
+  const baseUrlOverride =
+    process.env.OPENAI_BASE_URL?.trim() ||
+    process.env.OPENAI_API_BASE?.trim() ||
+    undefined
+  const modelOverride = process.env.OPENAI_MODEL?.trim() || undefined
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('aimlapi')
+  process.env.OPENAI_MODEL = modelOverride ?? getRouteDefaultModel('aimlapi')
+  process.env.OPENAI_API_KEY = process.env.AIMLAPI_API_KEY
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
   delete process.env.OPENAI_AUTH_HEADER
   delete process.env.OPENAI_AUTH_SCHEME
   delete process.env.OPENAI_AUTH_HEADER_VALUE
@@ -333,48 +393,76 @@ export async function getAnthropicClient({
 }): Promise<Anthropic> {
   // Convert the runtime effort value to the OpenAI-shaped enum the shim
   // expects. Undefined → shim falls back to descriptor/alias defaults.
+  const effortProcessEnv = providerOverride
+    ? { ...process.env, OPENAI_AZURE_STYLE: undefined }
+    : process.env
   const effortModel = providerOverride?.model ?? model
-  const providerOverrideRuntimeContext = providerOverride && effortModel
+  const effortBaseUrl =
+    providerOverride?.baseURL ??
+    process.env.OPENAI_BASE_URL ??
+    process.env.OPENAI_API_BASE
+  const effortRuntimeContext = effortModel
     ? resolveOpenAIShimRuntimeContext({
-      processEnv: process.env,
-      baseUrl: providerOverride.baseURL,
+      processEnv: effortProcessEnv,
+      baseUrl: effortBaseUrl,
       model: effortModel,
-      preferBaseUrlRoute: true,
+      preferBaseUrlRoute:
+        providerOverride !== undefined || isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI),
     })
     : undefined
-  const providerOverrideShimConfig = providerOverrideRuntimeContext?.openaiShimConfig
-  const providerOverrideEffortContext = providerOverrideRuntimeContext
-    ? {
-        routeId: providerOverrideRuntimeContext.routeId,
+  const effortShimConfig = effortRuntimeContext?.openaiShimConfig
+  const effortContext = effortRuntimeContext
+      ? {
+        routeId: effortRuntimeContext.routeId ?? 'custom',
         useRuntimeFallback: false,
-        openaiShimConfig: providerOverrideShimConfig,
-        apiProvider: providerOverrideRuntimeContext.routeId === 'openai'
+        openaiShimConfig: effortShimConfig,
+        baseUrl: effortBaseUrl,
+        processEnv: effortProcessEnv,
+        apiProvider: effortRuntimeContext.routeId === 'openai'
           ? 'openai' as const
-          : providerOverrideRuntimeContext.routeId === 'codex'
+          : effortRuntimeContext.routeId === 'codex'
             ? 'codex' as const
             : undefined,
       }
     : undefined
   const supportsShimReasoningEffort = effortModel
-    ? providerOverrideShimConfig
+    ? effortShimConfig
       ? modelSupportsShimReasoningEffort(
         effortModel,
-        providerOverrideShimConfig.thinkingRequestFormat,
-        providerOverrideShimConfig.removeBodyFields,
-        providerOverrideEffortContext,
+        effortShimConfig.thinkingRequestFormat,
+        effortShimConfig.removeBodyFields,
+        effortContext,
       )
       : modelSupportsWireEffort(effortModel)
     : false
-  const appliedProviderOverrideEffort = effortModel && effortValue !== undefined
+  const reasoningControl = effortModel
+    ? resolveModelReasoningControl(effortModel, effortContext)
+    : undefined
+  const k3ReasoningControl =
+    reasoningControl?.source === 'metadata' &&
+    reasoningControl.wireFormat === 'reasoning_effort' &&
+    reasoningControl.levels.length === 3 &&
+    reasoningControl.levels.includes('low') &&
+    reasoningControl.levels.includes('high') &&
+    reasoningControl.levels.includes('max')
+  const appliedEffort = effortModel && effortValue !== undefined
     ? resolveAppliedEffort(
       effortModel,
       effortValue,
-      providerOverrideEffortContext,
+      effortContext,
     )
     : undefined
-  const shimReasoningEffort: OpenAIEffortLevel | undefined =
-    appliedProviderOverrideEffort !== undefined && supportsShimReasoningEffort
-      ? standardEffortToOpenAI(convertEffortValueToLevel(appliedProviderOverrideEffort))
+  const appliedEffortLevel = appliedEffort === undefined
+    ? undefined
+    : convertEffortValueToLevel(appliedEffort)
+  const shimReasoningEffort: OpenAIShimEffortLevel | undefined =
+    appliedEffortLevel !== undefined && supportsShimReasoningEffort
+      ? (reasoningControl?.source === 'metadata' &&
+          reasoningControl.wireFormat === 'reasoning_effort' &&
+          appliedEffortLevel === 'max' &&
+          k3ReasoningControl
+            ? 'max'
+          : standardEffortToOpenAI(appliedEffortLevel))
       : undefined
   const containerId = process.env.CLAUDE_CODE_CONTAINER_ID
   const remoteSessionId = process.env.CLAUDE_CODE_REMOTE_SESSION_ID
@@ -419,6 +507,10 @@ export async function getAnthropicClient({
     envOnlyProviderRouteId === 'nearai' && !useMiniMaxEnvOnlyProvider
   const useFireworksEnvOnlyProvider =
     envOnlyProviderRouteId === 'fireworks' && !useMiniMaxEnvOnlyProvider
+  const useLongcatEnvOnlyProvider =
+    envOnlyProviderRouteId === 'longcat' && !useMiniMaxEnvOnlyProvider
+  const useAimlapiEnvOnlyProvider =
+    envOnlyProviderRouteId === 'aimlapi' && !useMiniMaxEnvOnlyProvider
   if (useMiniMaxEnvOnlyProvider) {
     applyMiniMaxEnvOnlyDefaults(model)
   }
@@ -434,9 +526,20 @@ export async function getAnthropicClient({
   if (useFireworksEnvOnlyProvider) {
     applyFireworksEnvOnlyDefaults()
   }
+  if (useLongcatEnvOnlyProvider) {
+    applyLongcatEnvOnlyDefaults()
+  }
+  if (useAimlapiEnvOnlyProvider) {
+    applyAimlapiEnvOnlyDefaults()
+  }
 
-  const shouldUseFirstPartyAuth =
-    shouldUseFirstPartyAnthropicAuth(providerOverride)
+  const apiProvider = getAPIProvider()
+  const isFirstPartyBaseUrl = isFirstPartyAnthropicBaseUrl()
+  const shouldUseFirstPartyAuth = shouldUseFirstPartyAnthropicAuthForProvider({
+    providerOverride,
+    apiProvider,
+    isFirstPartyBaseUrl,
+  })
   const useMiniMaxNativeProvider =
     useMiniMaxEnvOnlyProvider ||
     (getAPIProvider() === 'minimax' &&
@@ -450,9 +553,29 @@ export async function getAnthropicClient({
 
   const isClaudeAiSubscriber =
     shouldUseFirstPartyAuth && isClaudeAISubscriber()
+  const anthropicAuthToken = process.env.ANTHROPIC_AUTH_TOKEN?.trim()
+  const usesCustomAnthropicAuthToken = shouldUseCustomAnthropicBearerAuth({
+    providerOverride,
+    apiProvider,
+    isFirstPartyBaseUrl,
+    authToken: anthropicAuthToken,
+  })
 
-  if (shouldUseFirstPartyAuth && !isClaudeAiSubscriber) {
-    await configureApiKeyHeaders(defaultHeaders, getIsNonInteractiveSession())
+  if (
+    (shouldUseFirstPartyAuth && !isClaudeAiSubscriber) ||
+    usesCustomAnthropicAuthToken
+  ) {
+    await configureApiKeyHeaders(
+      defaultHeaders,
+      getIsNonInteractiveSession(),
+      usesCustomAnthropicAuthToken ? anthropicAuthToken : undefined,
+    )
+  } else if (apiProvider === 'firstParty' && !isFirstPartyBaseUrl) {
+    removeManagedAnthropicAuthHeaders(defaultHeaders)
+    const anthropicApiKey = process.env.ANTHROPIC_API_KEY?.trim()
+    if (anthropicApiKey) {
+      defaultHeaders['X-Api-Key'] = anthropicApiKey
+    }
   }
 
   const resolvedFetch = buildFetch(fetchOverride, source)
@@ -512,6 +635,7 @@ export async function getAnthropicClient({
     useXaiEnvOnlyProvider ||
     useNearaiEnvOnlyProvider ||
     useFireworksEnvOnlyProvider ||
+    useAimlapiEnvOnlyProvider ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI) ||
@@ -526,7 +650,15 @@ export async function getAnthropicClient({
     }) as unknown as Anthropic
   }
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)) {
-    const { AnthropicBedrock } = await import('@anthropic-ai/bedrock-sdk')
+    // Loaded via the runtime importer (not a static `import()`), so esbuild
+    // stays blind to it and does NOT inline @anthropic-ai/bedrock-sdk — which
+    // statically imports @aws-sdk/client-bedrock-runtime. Inlining would hoist
+    // that AWS import into the CLI bundle and require it at startup for every
+    // user. Keeping it lazy means only Bedrock users install the SDK (which
+    // pulls @aws-sdk transitively).
+    const { AnthropicBedrock } = await importOptionalRuntimeModuleForClient<
+      typeof import('@anthropic-ai/bedrock-sdk')
+    >('@anthropic-ai/bedrock-sdk', 'AWS Bedrock')
     // Use region override for small fast model if specified
     const awsRegion =
       model === getSmallFastModel() &&
@@ -570,9 +702,9 @@ export async function getAnthropicClient({
     ) as unknown as Anthropic
   }
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)) {
-    const { AnthropicFoundry } = await importRuntimeModule(
-      '@anthropic-ai/foundry-sdk',
-    )
+    const { AnthropicFoundry } = await importOptionalRuntimeModuleForClient<
+      typeof import('@anthropic-ai/foundry-sdk')
+    >('@anthropic-ai/foundry-sdk', 'Azure Foundry')
     // Determine Azure AD token provider based on configuration
     // SDK reads ANTHROPIC_FOUNDRY_API_KEY by default
     let azureADTokenProvider: (() => Promise<string>) | undefined
@@ -585,7 +717,10 @@ export async function getAnthropicClient({
         const {
           DefaultAzureCredential: AzureCredential,
           getBearerTokenProvider,
-        } = await importRuntimeModule('@azure/identity')
+        } =
+          await importOptionalRuntimeModuleForClient<
+            typeof import('@azure/identity')
+          >('@azure/identity', 'Azure Foundry authentication')
         azureADTokenProvider = getBearerTokenProvider(
           new AzureCredential(),
           'https://cognitiveservices.azure.com/.default',
@@ -608,7 +743,6 @@ export async function getAnthropicClient({
       await refreshGcpCredentialsIfNeeded()
     }
 
-    const { GoogleAuth } = await importRuntimeModule('google-auth-library')
     // TODO: Cache either GoogleAuth instance or AuthClient to improve performance
     // Currently we create a new GoogleAuth instance for every getAnthropicClient() call
     // This could cause repeated authentication flows and metadata server checks
@@ -643,33 +777,42 @@ export async function getAnthropicClient({
       process.env['GOOGLE_APPLICATION_CREDENTIALS'] ||
       process.env['google_application_credentials']
 
-    const googleAuth = isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)
-      ? ({
-          // Mock GoogleAuth for testing/proxy scenarios
-          getClient: () => ({
-            getRequestHeaders: () => ({}),
-          }),
-        } as {
-          getClient: () => {
-            getRequestHeaders: () => Record<string, string>
-          }
-        })
-      : new GoogleAuth({
-          scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-          // Only use ANTHROPIC_VERTEX_PROJECT_ID as last resort fallback
-          // This prevents the 12-second metadata server timeout when:
-          // - No project env vars are set AND
-          // - No credential keyfile is specified AND
-          // - ADC file exists but lacks project_id field
-          //
-          // Risk: If auth project != API target project, this could cause billing/audit issues
-          // Mitigation: Users can set GOOGLE_CLOUD_PROJECT to override
-          ...(hasProjectEnvVar || hasKeyFile
-            ? {}
-            : {
-                projectId: process.env.ANTHROPIC_VERTEX_PROJECT_ID,
-              }),
-        })
+    let googleAuth: {
+      getClient: () => { getRequestHeaders: () => Record<string, string> }
+    }
+    if (isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)) {
+      // Mock GoogleAuth for testing/proxy scenarios. This path intentionally
+      // does NOT load google-auth-library — proxy/test runs must work even when
+      // the optional package is absent (it is only needed for real auth below).
+      googleAuth = {
+        getClient: () => ({
+          getRequestHeaders: () => ({}),
+        }),
+      }
+    } else {
+      const { GoogleAuth } = await importOptionalRuntimeModuleForClient<
+        typeof import('google-auth-library')
+      >('google-auth-library', 'Vertex AI (GCP) authentication')
+      // The real GoogleAuth (async getClient) is wider than the minimal shape
+      // declared above and shared with the mock; AnthropicVertex accepts it at
+      // runtime, so narrow it back to the shared shape here.
+      googleAuth = new GoogleAuth({
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+        // Only use ANTHROPIC_VERTEX_PROJECT_ID as last resort fallback
+        // This prevents the 12-second metadata server timeout when:
+        // - No project env vars are set AND
+        // - No credential keyfile is specified AND
+        // - ADC file exists but lacks project_id field
+        //
+        // Risk: If auth project != API target project, this could cause billing/audit issues
+        // Mitigation: Users can set GOOGLE_CLOUD_PROJECT to override
+        ...(hasProjectEnvVar || hasKeyFile
+          ? {}
+          : {
+              projectId: process.env.ANTHROPIC_VERTEX_PROJECT_ID,
+            }),
+      }) as unknown as typeof googleAuth
+    }
 
     const vertexArgs = {
       ...ARGS,
@@ -683,20 +826,28 @@ export async function getAnthropicClient({
 
   // Determine authentication method based on available tokens
   const clientConfig: ConstructorParameters<typeof Anthropic>[0] = {
-    apiKey: isClaudeAiSubscriber
+    apiKey: isClaudeAiSubscriber || usesCustomAnthropicAuthToken
       ? null
       : useMiniMaxNativeProvider
         ? process.env.MINIMAX_API_KEY || process.env.ANTHROPIC_API_KEY
-        : apiKey || getAnthropicApiKey(),
+        : apiKey ||
+          (!isFirstPartyBaseUrl
+            ? process.env.ANTHROPIC_API_KEY?.trim()
+            : getAnthropicApiKey()),
+    // Pass an explicit null for non-Bearer routes so the SDK cannot fall back
+    // to ANTHROPIC_AUTH_TOKEN from its own environment lookup.
     authToken: isClaudeAiSubscriber
       ? getClaudeAIOAuthTokens()?.accessToken
-      : undefined,
+      : usesCustomAnthropicAuthToken
+        ? anthropicAuthToken
+        : null,
     // Set baseURL from OAuth config when using staging OAuth
-    ...(process.env.USER_TYPE === 'ant' &&
+    ...(shouldUseFirstPartyAuth &&
+    process.env.USER_TYPE === 'ant' &&
     isEnvTruthy(process.env.USE_STAGING_OAUTH)
       ? { baseURL: getOauthConfig().BASE_API_URL }
       : process.env.ANTHROPIC_BASE_URL
-        ? { baseURL: process.env.ANTHROPIC_BASE_URL }
+        ? { baseURL: process.env.ANTHROPIC_BASE_URL.replace(/\/v1\/?$/i, '') }
         : {}),
     ...ARGS,
     ...(isDebugToStdErr() && { logger: createStderrLogger() }),
@@ -708,13 +859,27 @@ export async function getAnthropicClient({
 async function configureApiKeyHeaders(
   headers: Record<string, string>,
   isNonInteractiveSession: boolean,
+  authToken?: string,
 ): Promise<void> {
-  const token =
-    process.env.ANTHROPIC_AUTH_TOKEN ||
-    (await getApiKeyFromApiKeyHelper(isNonInteractiveSession))
+  const token = authToken || (await getApiKeyFromApiKeyHelper(isNonInteractiveSession))
   if (token) {
+    removeManagedAnthropicAuthHeaders(headers)
     headers['Authorization'] = `Bearer ${token}`
   }
+}
+
+function removeManagedAnthropicAuthHeaders(headers: Record<string, string>): void {
+  for (const name of Object.keys(headers)) {
+    const lower = name.toLowerCase()
+    if (lower === 'authorization' || lower === 'x-api-key' || lower === 'api-key') {
+      delete headers[name]
+    }
+  }
+  // The Anthropic SDK also reads ANTHROPIC_CUSTOM_HEADERS. Null sentinels clear
+  // those env-parsed managed auth headers before the supported credential wins.
+  headers.Authorization = null as unknown as string
+  headers['X-Api-Key'] = null as unknown as string
+  headers['api-key'] = null as unknown as string
 }
 
 function getCustomHeaders(): Record<string, string> {
@@ -734,7 +899,13 @@ function getCustomHeaders(): Record<string, string> {
     if (colonIdx === -1) continue
     const name = headerString.slice(0, colonIdx).trim()
     const value = headerString.slice(colonIdx + 1).trim()
-    if (name) {
+    const lowerName = name.toLowerCase()
+    if (
+      name &&
+      lowerName !== 'authorization' &&
+      lowerName !== 'x-api-key' &&
+      lowerName !== 'api-key'
+    ) {
       customHeaders[name] = value
     }
   }

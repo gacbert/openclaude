@@ -21,6 +21,7 @@ const originalEnv = {
   OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
   OPENAI_API_BASE: process.env.OPENAI_API_BASE,
   OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+  AIMLAPI_API_KEY: process.env.AIMLAPI_API_KEY,
   OPENAI_MODEL: process.env.OPENAI_MODEL,
   CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED:
     process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED,
@@ -28,6 +29,7 @@ const originalEnv = {
     process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID,
   MINIMAX_API_KEY: process.env.MINIMAX_API_KEY,
   XAI_API_KEY: process.env.XAI_API_KEY,
+  LONGCAT_API_KEY: process.env.LONGCAT_API_KEY,
   CLAUDE_CODE_MAX_CONTEXT_TOKENS: process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS,
   USER_TYPE: process.env.USER_TYPE,
 }
@@ -42,11 +44,13 @@ beforeEach(async () => {
   delete process.env.OPENAI_BASE_URL
   delete process.env.OPENAI_API_BASE
   delete process.env.OPENAI_API_KEY
+  delete process.env.AIMLAPI_API_KEY
   delete process.env.OPENAI_MODEL
   delete process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED
   delete process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID
   delete process.env.MINIMAX_API_KEY
   delete process.env.XAI_API_KEY
+  delete process.env.LONGCAT_API_KEY
   delete process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS
   delete process.env.USER_TYPE
 })
@@ -96,6 +100,11 @@ afterEach(() => {
     } else {
       process.env.OPENAI_API_KEY = originalEnv.OPENAI_API_KEY
     }
+    if (originalEnv.AIMLAPI_API_KEY === undefined) {
+      delete process.env.AIMLAPI_API_KEY
+    } else {
+      process.env.AIMLAPI_API_KEY = originalEnv.AIMLAPI_API_KEY
+    }
     if (originalEnv.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED === undefined) {
       delete process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED
     } else {
@@ -117,6 +126,11 @@ afterEach(() => {
       delete process.env.XAI_API_KEY
     } else {
       process.env.XAI_API_KEY = originalEnv.XAI_API_KEY
+    }
+    if (originalEnv.LONGCAT_API_KEY === undefined) {
+      delete process.env.LONGCAT_API_KEY
+    } else {
+      process.env.LONGCAT_API_KEY = originalEnv.LONGCAT_API_KEY
     }
     if (originalEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS === undefined) {
       delete process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS
@@ -407,6 +421,39 @@ test('gpt-5.3-codex-spark has explicit conservative metadata', () => {
     default: 32_000,
     upperLimit: 32_000,
   })
+})
+
+test('gpt-5.6 family pins the Codex effective input limit on the Codex route', () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://chatgpt.com/backend-api/codex'
+  delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
+  delete process.env.OPENAI_MODEL
+
+  // Same rationale as gpt-5.5 above, but scoped to the Codex transport: the
+  // Codex base URL resolves to a catalog-less route, so the gpt.ts
+  // descriptor (pinned to the ~272k effective input boundary, issue #1118)
+  // is what sizes the context there.
+  for (const model of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+    expect(getContextWindowForModel(model)).toBe(272_000)
+    expect(getModelMaxOutputTokens(model)).toEqual({
+      default: 128_000,
+      upperLimit: 128_000,
+    })
+  }
+})
+
+test('gpt-5.6 family keeps the full window on the direct-OpenAI route', () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  delete process.env.OPENAI_BASE_URL
+  delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
+  delete process.env.OPENAI_MODEL
+
+  // Unlike gpt-5.5 (Codex-only, blanket-capped in the vendor catalog), the
+  // gpt-5.6 family is also served directly by api.openai.com /v1/responses
+  // at its true 1.05M window; the openai-route catalog entry preserves it.
+  for (const model of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+    expect(getContextWindowForModel(model)).toBe(1_050_000)
+  }
 })
 
 test('gpt-5.4 family uses provider-specific context and output caps', () => {
@@ -814,6 +861,26 @@ test('Kimi Code kimi-for-coding uses provider-specific context and output caps',
     default: 32_768,
     upperLimit: 32_768,
   })
+})
+
+test('Kimi Code K3 1M choice uses the Allegretto cap', () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.kimi.com/coding/v1'
+  delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
+
+  expect(getContextWindowForModel('k3')).toBe(1_048_576)
+  expect(getModelMaxOutputTokens('k3')).toEqual({
+    default: 32_768,
+    upperLimit: 32_768,
+  })
+})
+
+test('Kimi Code K3 256K catalog choice uses the Moderato cap', () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.kimi.com/coding/v1'
+  delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
+
+  expect(getContextWindowForModel('k3-256k')).toBe(262_144)
 })
 
 test('DashScope glm-5 uses provider-specific context and output caps', () => {

@@ -58,6 +58,12 @@ import {
 } from '../../utils/api.js'
 import { getOauthAccountInfo } from '../../utils/auth.js'
 import {
+  getStreamingAbortMessage,
+  isExpectedSideTaskAbortReason,
+  normalizeAbortReason,
+  shouldCreateUserInterruptionMessage,
+} from '../../utils/abortReasons.js'
+import {
   getBedrockExtraBodyParamsBetas,
   getMergedBetas,
   getModelBetas,
@@ -102,6 +108,7 @@ import {
   extractQuotaStatusFromHeaders,
 } from '../claudeAiLimits.js'
 import { getAPIContextManagement } from '../compact/apiMicrocompact.js'
+import { getStreamIdleTimeoutMs } from './openaiShim.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER')
@@ -111,7 +118,6 @@ const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER')
 import { feature } from 'bun:bundle'
 import type { ClientOptions } from '@anthropic-ai/sdk'
 import {
-  APIConnectionTimeoutError,
   APIError,
   APIUserAbortError,
 } from '@anthropic-ai/sdk/error'
@@ -346,7 +352,12 @@ export function getPromptCachingEnabled(model: string): boolean {
   // format, so cache_control blocks are supported.
   const provider = getAPIProvider()
   const isNativeGithub = isGithubNativeAnthropicMode(model)
-  if (provider !== 'firstParty' && provider !== 'bedrock' && provider !== 'vertex' && !isNativeGithub) {
+  if (
+    (provider !== 'firstParty' || !isFirstPartyAnthropicBaseUrl()) &&
+    provider !== 'bedrock' &&
+    provider !== 'vertex' &&
+    !isNativeGithub
+  ) {
     return false
   }
 
@@ -457,7 +468,7 @@ function should1hCacheTTL(querySource?: QuerySource): boolean {
  *
  */
 function configureEffortParams(
-  effortValue: EffortValue | undefined,
+  effortValue: Exclude<EffortValue, 'ultracode'> | undefined,
   outputConfig: BetaOutputConfig,
   extraBodyParams: Record<string, unknown>,
   betas: string[],
@@ -801,6 +812,45 @@ export async function* queryModelWithStreaming({
   })
 }
 
+export function getClaudeStreamingAbortLogMessage(
+  signal: Pick<AbortSignal, 'reason'>,
+  streamingError: unknown,
+): string {
+  return getStreamingAbortMessage(signal.reason, errorMessage(streamingError))
+}
+
+export function getClaudeExpectedSideTaskApiAbortLogMessage(
+  signal: Pick<AbortSignal, 'aborted' | 'reason'>,
+  errorFromRetry: unknown,
+): string | null {
+  if (!signal.aborted || !isExpectedSideTaskAbortReason(signal.reason)) {
+    return null
+  }
+  const error =
+    errorFromRetry instanceof CannotRetryError
+      ? errorFromRetry.originalError
+      : errorFromRetry
+  if (!(error instanceof APIUserAbortError)) {
+    return null
+  }
+  return `Expected side-task API abort (${normalizeAbortReason(signal.reason)}): ${errorMessage(error)}`
+}
+
+function handleClaudeExpectedSideTaskApiAbort(
+  signal: Pick<AbortSignal, 'aborted' | 'reason'>,
+  errorFromRetry: unknown,
+  releaseStreamResources: () => void,
+): boolean {
+  const expectedSideTaskAbortLogMessage =
+    getClaudeExpectedSideTaskApiAbortLogMessage(signal, errorFromRetry)
+  if (!expectedSideTaskAbortLogMessage) return false
+  if (!(errorFromRetry instanceof CannotRetryError)) {
+    logForDebugging(expectedSideTaskAbortLogMessage)
+  }
+  releaseStreamResources()
+  return true
+}
+
 /**
  * Determines if an LSP tool should be deferred (tool appears with defer_loading: true)
  * because LSP initialization is not yet complete.
@@ -1053,6 +1103,39 @@ export function stripExcessMediaItems(
   }) as (UserMessage | AssistantMessage)[]
 }
 
+/**
+ * Tool-history compression routing for Anthropic-native transports (exported
+ * for focused tests — queryModel itself needs a live client to exercise).
+ * Native transports (first-party, Bedrock, Vertex, GitHub-native-Anthropic)
+ * compress only while prompt caching is inactive: retroactive tier rewrites
+ * diverge the cached request prefix and cost more than they save. Requests
+ * carrying a per-agent providerOverride are shim-routed and compress at the
+ * shim layer instead.
+ */
+export function shouldCompressNativeToolHistory(options: {
+  apiProvider: string
+  // firstParty alone is not enough: a custom ANTHROPIC_BASE_URL (proxy /
+  // compatible endpoint) also reports firstParty, but getPromptCachingEnabled
+  // already returns false there — treating it as native would compress every
+  // request against an endpoint we make no assumptions about. Mirror the
+  // same base-URL guard prompt caching itself uses.
+  isFirstPartyBaseUrl: boolean
+  isGithubNativeAnthropic: boolean
+  hasProviderOverride: boolean
+  promptCachingEnabled: boolean
+}): boolean {
+  const isNativeTransport =
+    (options.apiProvider === 'firstParty' && options.isFirstPartyBaseUrl) ||
+    options.apiProvider === 'bedrock' ||
+    options.apiProvider === 'vertex' ||
+    options.isGithubNativeAnthropic
+  return (
+    isNativeTransport &&
+    !options.hasProviderOverride &&
+    !options.promptCachingEnabled
+  )
+}
+
 async function* queryModel(
   messages: Message[],
   systemPrompt: SystemPrompt,
@@ -1068,6 +1151,7 @@ async function* queryModel(
   // init (~10ms). For non-Opus models (haiku, sonnet) this skips the await
   // entirely. Subscribers don't hit this path at all.
   if (
+    isFirstPartyAnthropicBaseUrl() &&
     !isClaudeAISubscriber() &&
     isNonCustomOpusModel(options.model) &&
     (
@@ -1295,6 +1379,32 @@ async function* queryModel(
 
   queryCheckpoint('query_tool_schema_build_end')
 
+  // Compress old tool outputs for Anthropic-native transports, but only when
+  // prompt caching is inactive. Rewriting old messages as they cross tier
+  // boundaries diverges the request prefix on every call, which breaks the
+  // prompt cache and costs more than the compression saves — cached native
+  // sessions rely on microCompact (cache-aware) instead. Shim-routed traffic
+  // (OpenAI-compatible env providers, per-agent providerOverride, Codex)
+  // compresses at its own layer, where the local fast-path opt-out applies.
+  // compressToolHistory is generic over AnyMessage — cast to satisfy the type
+  // checker since OpenClaude's Message union is a superset of what the
+  // function actually inspects.
+  const compressNativeToolHistory = shouldCompressNativeToolHistory({
+    apiProvider: getAPIProvider(),
+    isFirstPartyBaseUrl: isFirstPartyAnthropicBaseUrl(),
+    isGithubNativeAnthropic: isGithubNativeAnthropicMode(options.model),
+    hasProviderOverride: Boolean(options.providerOverride),
+    promptCachingEnabled: getPromptCachingEnabled(options.model),
+  })
+  if (compressNativeToolHistory) {
+    const { compressToolHistory } = await import('./compressToolHistory.js')
+    messages = compressToolHistory(
+      messages as unknown as Parameters<typeof compressToolHistory>[0],
+      options.model,
+      { effectiveContextWindowSize: getContextWindowForModel(options.model, getSdkBetas()) },
+    ) as typeof messages
+  }
+
   // Normalize messages before building system prompt (needed for fingerprinting)
   // Instrumentation: Track message count before normalization
   logEvent('tengu_api_before_normalize', {
@@ -1499,6 +1609,7 @@ async function* queryModel(
       !cacheEditingHeaderLatched &&
       cachedMCEnabled &&
       getAPIProvider() === 'firstParty' &&
+      isFirstPartyAnthropicBaseUrl() &&
       options.querySource === 'repl_main_thread'
     ) {
       cacheEditingHeaderLatched = true
@@ -1738,10 +1849,12 @@ async function* queryModel(
     const useCachedMC =
       cachedMCEnabled &&
       getAPIProvider() === 'firstParty' &&
+      isFirstPartyAnthropicBaseUrl() &&
       options.querySource === 'repl_main_thread'
     if (
       cacheEditingHeaderLatched &&
       getAPIProvider() === 'firstParty' &&
+      isFirstPartyAnthropicBaseUrl() &&
       options.querySource === 'repl_main_thread' &&
       !betasParams.includes(cacheEditingBetaHeader)
     ) {
@@ -1962,7 +2075,7 @@ async function* queryModel(
     // the session indefinitely since the SDK's request timeout only covers the
     // initial fetch(), not the streaming body.
     // Enabled by default, matching the always-on idle timeout already used by
-    // the OpenAI/Codex shims (readWithTimeout). A silently dropped Anthropic
+    // the OpenAI/Codex shims. A silently dropped Anthropic
     // stream now aborts and falls back to a non-streaming retry within
     // STREAM_IDLE_TIMEOUT_MS, instead of hanging until QueryGuard's 5-minute
     // idle timeout. Opt out with CLAUDE_DISABLE_STREAM_WATCHDOG=1 (or by
@@ -1970,8 +2083,7 @@ async function* queryModel(
     const streamWatchdogEnabled =
       !isEnvTruthy(process.env.CLAUDE_DISABLE_STREAM_WATCHDOG) &&
       !isEnvDefinedFalsy(process.env.CLAUDE_ENABLE_STREAM_WATCHDOG)
-    const STREAM_IDLE_TIMEOUT_MS =
-      parseInt(process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS || '', 10) || 90_000
+    const STREAM_IDLE_TIMEOUT_MS = getStreamIdleTimeoutMs()
     const STREAM_IDLE_WARNING_MS = STREAM_IDLE_TIMEOUT_MS / 2
     let streamIdleAborted = false
     // performance.now() snapshot when watchdog fires, for measuring abort propagation delay
@@ -2472,13 +2584,10 @@ async function* queryModel(
                 max_tokens: maxOutputTokens,
                 output_tokens: usage.output_tokens,
               })
-              // Reuse the max_output_tokens recovery path — from the model's
-              // perspective, both mean "response was cut off, continue from
-              // where you left off."
               yield createAssistantAPIErrorMessage({
                 content: `${API_ERROR_MESSAGE_PREFIX}: The model has reached its context window limit.`,
-                apiError: 'max_output_tokens',
-                error: 'max_output_tokens',
+                apiError: 'context_overflow',
+                error: 'invalid_request',
               })
             }
             break
@@ -2623,15 +2732,16 @@ async function* queryModel(
       }
 
       if (streamingError instanceof APIUserAbortError) {
-        // Check if the abort signal was triggered by the user (ESC key)
-        // If the signal is aborted, it's a user-initiated abort
+        // If the signal is aborted, classify by the AbortSignal reason.
         // If not, it's likely a timeout from the SDK
         if (signal.aborted) {
-          // This is a real user abort (ESC key was pressed)
           logForDebugging(
-            `Streaming aborted by user: ${errorMessage(streamingError)}`,
+            getClaudeStreamingAbortLogMessage(signal, streamingError),
           )
-          if (isAdvisorInProgress) {
+          if (
+            isAdvisorInProgress &&
+            shouldCreateUserInterruptionMessage(signal.reason)
+          ) {
             logEvent('tengu_advisor_tool_interrupted', {
               model:
                 options.model as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -2647,14 +2757,14 @@ async function* queryModel(
             `Streaming timeout (SDK abort): ${streamingError.message}`,
             { level: 'error' },
           )
-          // Throw a more specific error for timeout
-          throw new APIConnectionTimeoutError({ message: 'Request timed out' })
+          // Treat provider/SDK stream timeouts like other streaming failures:
+          // fall back below while the parent query signal is still live.
         }
       }
 
       if (signal.aborted) {
         logForDebugging(
-          `Streaming aborted by parent signal: ${errorMessage(streamingError)}`,
+          getClaudeStreamingAbortLogMessage(signal, streamingError),
         )
         throw new APIUserAbortError()
       }
@@ -2804,6 +2914,16 @@ async function* queryModel(
       throw errorFromRetry
     }
 
+    if (
+      handleClaudeExpectedSideTaskApiAbort(
+        signal,
+        errorFromRetry,
+        releaseStreamResources,
+      )
+    ) {
+      return
+    }
+
     if (signal.aborted) {
       releaseStreamResources()
       return
@@ -2904,6 +3024,16 @@ async function* queryModel(
         // Propagate model-fallback signal to query.ts (see comment above).
         if (fallbackError instanceof FallbackTriggeredError) {
           throw fallbackError
+        }
+
+        if (
+          handleClaudeExpectedSideTaskApiAbort(
+            signal,
+            fallbackError,
+            releaseStreamResources,
+          )
+        ) {
+          return
         }
 
         // Fallback also failed, handle as normal error

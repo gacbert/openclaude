@@ -571,6 +571,7 @@ class Project {
   currentSessionPrUrl: string | undefined
   currentSessionPrRepository: string | undefined
   currentSessionGoal: GoalStateEntry['goal'] | undefined
+  currentSessionBranch: SessionBranchEntry | undefined
 
   sessionFile: string | null = null
   // Entries buffered while sessionFile is null. Flushed by materializeSessionFile
@@ -871,6 +872,12 @@ class Project {
         type: 'goal-state',
         sessionId,
         goal: this.currentSessionGoal,
+      })
+    }
+    if (this.currentSessionBranch) {
+      appendEntryToFile(this.sessionFile, {
+        ...this.currentSessionBranch,
+        sessionId,
       })
     }
   }
@@ -2847,6 +2854,9 @@ function convertToLogOption(
   agentSetting?: string,
   contentReplacements?: ContentReplacementRecord[],
 ): LogOption {
+  if (transcript.length === 0) {
+    throw new Error('convertToLogOption: cannot convert empty transcript')
+  }
   const lastMessage = transcript.at(-1)!
   const firstMessage = transcript[0]!
 
@@ -3126,6 +3136,7 @@ export function restoreSessionMetadata(meta: {
   prUrl?: string
   prRepository?: string
   goal?: GoalStateEntry['goal']
+  sessionBranch?: SessionBranchEntry
 }): void {
   const project = getProject()
   // ??= so --name (cacheSessionTitle) wins over the resumed
@@ -3146,6 +3157,9 @@ export function restoreSessionMetadata(meta: {
   // resumed session has no goal. Clear any cached goal so adopt/re-append
   // cannot persist a previous session's active goal into this transcript.
   project.currentSessionGoal = meta.goal ?? undefined
+  // Branch lineage is structural metadata. Absence means this session is not
+  // a branch, so clear stale branch cache before it can be re-appended.
+  project.currentSessionBranch = meta.sessionBranch ?? undefined
 }
 
 /**
@@ -3167,6 +3181,7 @@ export function clearSessionMetadata(): void {
   project.currentSessionPrUrl = undefined
   project.currentSessionPrRepository = undefined
   project.currentSessionGoal = undefined
+  project.currentSessionBranch = undefined
 }
 
 /**
@@ -4987,6 +5002,79 @@ type LiteMetadata = {
   prNumber?: number
   prUrl?: string
   prRepository?: string
+  sessionBranch?: SessionBranchEntry
+}
+
+const SESSION_BRANCH_ENTRY_PREFIX = '{"type":"session-branch"'
+const SESSION_BRANCH_ENTRY_PREFIX_SPACED = '{"type": "session-branch"'
+
+function startsWithSessionBranchEntryPrefix(lineStart: string): boolean {
+  return (
+    lineStart.startsWith(SESSION_BRANCH_ENTRY_PREFIX) ||
+    lineStart.startsWith(SESSION_BRANCH_ENTRY_PREFIX_SPACED)
+  )
+}
+
+function isSessionBranchEntry(
+  entry: unknown,
+  sessionId?: string,
+): entry is SessionBranchEntry {
+  if (typeof entry !== 'object' || entry === null) return false
+  const candidate = entry as Partial<SessionBranchEntry>
+  return (
+    candidate.type === 'session-branch' &&
+    typeof candidate.sessionId === 'string' &&
+    (sessionId === undefined || candidate.sessionId === sessionId) &&
+    typeof candidate.parentSessionId === 'string' &&
+    typeof candidate.rootSessionId === 'string' &&
+    typeof candidate.branchedFromSessionId === 'string' &&
+    typeof candidate.branchedAt === 'string' &&
+    (candidate.branchName === undefined ||
+      typeof candidate.branchName === 'string') &&
+    (candidate.branchedAtMessageId === undefined ||
+      typeof candidate.branchedAtMessageId === 'string')
+  )
+}
+
+function parseSessionBranchMetadataLine(
+  line: string,
+  sessionId?: string,
+): SessionBranchEntry | undefined {
+  const trimmed = line.trim()
+  if (!startsWithSessionBranchEntryPrefix(trimmed)) {
+    return undefined
+  }
+  try {
+    const entry = jsonParse(trimmed)
+    return isSessionBranchEntry(entry, sessionId) ? entry : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function extractSessionBranchMetadataFromChunk(
+  chunk: string,
+  sessionId?: string,
+): SessionBranchEntry | undefined {
+  const lines = chunk.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const entry = parseSessionBranchMetadataLine(lines[i] ?? '', sessionId)
+    if (entry) return entry
+  }
+  return undefined
+}
+
+function extractSessionBranchMetadata(
+  head: string,
+  tail: string,
+  sessionId?: string,
+): SessionBranchEntry | undefined {
+  return (
+    extractSessionBranchMetadataFromChunk(tail, sessionId) ??
+    (head === tail
+      ? undefined
+      : extractSessionBranchMetadataFromChunk(head, sessionId))
+  )
 }
 
 /**
@@ -5138,10 +5226,12 @@ async function getLogsWithoutIndex(
  *
  * Accepts a shared buffer to avoid per-file allocation overhead.
  */
-async function readLiteMetadata(
+// exported for testing
+export async function readLiteMetadata(
   filePath: string,
   fileSize: number,
   buf: Buffer,
+  sessionId?: string,
 ): Promise<LiteMetadata> {
   const { head, tail } = await readHeadAndTail(filePath, fileSize, buf)
   if (!head) return { firstPrompt: '', isSidechain: false }
@@ -5176,7 +5266,15 @@ async function readLiteMetadata(
     extractLastJsonStringField(tail, 'aiTitle') ??
     extractLastJsonStringField(head, 'aiTitle')
   const summary = extractLastJsonStringField(tail, 'summary')
-  const tag = extractLastJsonStringField(tail, 'tag')
+  // Type-scope tag extraction to the {"type":"tag"} JSONL line to avoid
+  // collision with tool_use inputs containing a `tag` parameter (git tag,
+  // Docker tags, cloud resource tags). Those are nested inside an assistant
+  // entry appended after the tag entry, so an unscoped tail scan returns the
+  // tool's value. Mirrors listSessionsImpl.ts:132 and sessionStorage.ts:782.
+  const tagLine = tail.split('\n').findLast(l => l.startsWith('{"type":"tag"'))
+  const tag = tagLine
+    ? extractLastJsonStringField(tagLine, 'tag') || undefined
+    : undefined
   const gitBranch =
     extractLastJsonStringField(tail, 'gitBranch') ??
     extractJsonStringField(head, 'gitBranch')
@@ -5197,6 +5295,7 @@ async function readLiteMetadata(
       if (num > 0) prNumber = num
     }
   }
+  const sessionBranch = extractSessionBranchMetadata(head, tail, sessionId)
 
   return {
     firstPrompt,
@@ -5211,6 +5310,7 @@ async function readLiteMetadata(
     prNumber,
     prUrl,
     prRepository,
+    sessionBranch,
   }
 }
 
@@ -5428,7 +5528,12 @@ async function enrichLog(
 ): Promise<LogOption | null> {
   if (!log.isLite || !log.fullPath) return log
 
-  const meta = await readLiteMetadata(log.fullPath, log.fileSize ?? 0, readBuf)
+  const meta = await readLiteMetadata(
+    log.fullPath,
+    log.fileSize ?? 0,
+    readBuf,
+    log.sessionId,
+  )
 
   const enriched: LogOption = {
     ...log,
@@ -5444,6 +5549,7 @@ async function enrichLog(
     prNumber: meta.prNumber,
     prUrl: meta.prUrl,
     prRepository: meta.prRepository,
+    sessionBranch: meta.sessionBranch,
     projectPath: meta.projectPath ?? log.projectPath,
   }
 
