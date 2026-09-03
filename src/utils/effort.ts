@@ -706,6 +706,8 @@ function legacyModelSupportsMaxEffort(model: string): boolean {
   if (
     model.toLowerCase().includes('claude-opus-5') ||
     model.toLowerCase().includes('claude-sonnet-5') ||
+    // gacbert: Fable 5 / 5.1 accept the full low..max effort range.
+    model.toLowerCase().includes('claude-fable') ||
     model.toLowerCase().includes('opus-4-6') ||
     model.toLowerCase().includes('opus-4-7') ||
     model.toLowerCase().includes('opus-4-8')
@@ -738,6 +740,8 @@ function legacyModelSupportsXHighEffort(
   if (
     model.toLowerCase().includes('claude-opus-5') ||
     model.toLowerCase().includes('claude-sonnet-5') ||
+    // gacbert: Fable 5 / 5.1 accept xhigh.
+    model.toLowerCase().includes('claude-fable') ||
     model.toLowerCase().includes('opus-4-7') ||
     model.toLowerCase().includes('opus-4-8')
   ) {

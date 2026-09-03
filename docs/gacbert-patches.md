@@ -164,6 +164,54 @@ Expected:
   default requests omit thinking/sampling, explicit disable remains disabled,
   and xhigh/max stay distinct on Anthropic-shaped shim routes.
 
+## v0.25.0-gacbert.4 (2026-09-03)
+
+First-party support for Claude Fable 5 and 5.1. The CLI ships no Fable entry
+for the anthropic route, and an unlisted first-party id degrades *silently*
+rather than erroring, so a Fable turn was running at: a 200k context window
+(the `MODEL_CONTEXT_WINDOW_DEFAULT` fallback, compacting ~5x early), a 32k
+output default with a 64k ceiling, effort clamped to `high` (an id outside the
+xhigh/max allowlists loses both), budget-based thinking on `count_tokens`
+(a 400 the caller happens to swallow), no structured-outputs beta header, and
+`$5/$25` pricing against a `$10/$50` model.
+
+Every gate keys on the canonical name `claude-fable`, which both
+`claude-fable-5` and `claude-fable-5-1` collapse to via the
+`firstPartyNameToCanonical` regex fallback, so one entry serves both:
+
+- `utils/context.ts` — `modelUsesDefault1MContext` (native 1M, and therefore
+  no `context-1m-2025-08-07` beta header) and the 128k `getModelMaxOutputTokens`
+  branch.
+- `utils/effort.ts` — `legacyModelSupportsMaxEffort` and
+  `legacyModelSupportsXHighEffort`.
+- `utils/thinking.ts` — `modelOnlySupportsAdaptiveThinking`. Deliberately NOT
+  `modelDefaultsToAdaptiveThinking`: that gate is what lets
+  `--max-thinking-tokens 0` emit `thinking:{type:'disabled'}`, which Fable
+  rejects with a 400. Adaptive-only, never default-adaptive.
+- `utils/betas.ts` — `modelSupportsStructuredOutputs`, first-party only.
+- `utils/modelCost.ts` — a `claude-fable` key at `COST_TIER_10_50`. Note that
+  tier's cache-read rate ($1.00/Mtok) is higher than Fable 5.1's published
+  $0.25, so cache reads over-report; input/output are exact.
+- `utils/model/model.ts` — `Fable 5.1` / `Fable 5` display names.
+- `integrations/models/claude.ts` — a catalog entry for honesty only; the
+  anthropic-native transport short-circuits before the integration catalog is
+  consulted, so it is not load-bearing.
+
+Ultracode is unchanged: Fable still gets no standing multi-agent grant, and
+`--effort ultracode` lands on the ordinary ceiling.
+
+New coverage in `src/utils/fable.gacbert.test.ts` (9 tests) — each one fails
+against the unpatched tree, which is how the degradation above was measured.
+
+Post-build guards were extended in the same commit, both for the new Fable
+gates and for five older patches that had none: `modelUsesDefault1MContext`,
+the Spark catalog entry, the `VERB_ALT_IMPERATIVE` "now go" fix, the
+turn-scoped `CONTINUATION_NUDGE_MESSAGE`, the Terra codexplan default (with
+`requireAbsent` needles for upstream #2051's Sol flip), and
+`getAnthropicMessagesReasoningFields` (which upstream v0.30.0's openaiShim
+split will require re-homing). Every guard was negative-tested by mutating the
+built bundle and confirming it throws.
+
 ## v0.25.0-gacbert.3 (2026-07-26)
 
 Adds the Sonnet 5 launch behavior described above without changing the running

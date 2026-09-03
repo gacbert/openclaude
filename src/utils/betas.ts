@@ -147,6 +147,10 @@ export function modelSupportsStructuredOutputs(model: string): boolean {
   if (canonical.includes('claude-opus-5')) {
     return provider === 'firstParty' && isFirstPartyAnthropicBaseUrl()
   }
+  // gacbert: same first-party-only treatment for Fable 5 / 5.1.
+  if (canonical.includes('claude-fable')) {
+    return provider === 'firstParty' && isFirstPartyAnthropicBaseUrl()
+  }
   // Structured outputs only supported on firstParty and Foundry (not Bedrock/Vertex yet)
   if (
     (provider !== 'firstParty' || !isFirstPartyAnthropicBaseUrl()) &&

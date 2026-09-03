@@ -180,6 +180,12 @@ export function modelOnlySupportsAdaptiveThinking(model: string): boolean {
   return (
     canonical.includes('claude-opus-5') ||
     canonical.includes('claude-sonnet-5') ||
+    // gacbert: Fable 5 / 5.1 run thinking unconditionally and reject a
+    // budget_tokens config with a 400. Deliberately NOT added to
+    // modelDefaultsToAdaptiveThinking above: that gate is what lets
+    // `--max-thinking-tokens 0` emit `thinking:{type:'disabled'}`, which
+    // Fable also rejects. Adaptive-only here, never default-adaptive.
+    canonical.includes('claude-fable') ||
     canonical.includes('opus-4-8') ||
     canonical.includes('opus-4-7')
   )

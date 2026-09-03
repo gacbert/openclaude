@@ -172,6 +172,13 @@ export const MODEL_COSTS: Record<ModelShortName, ModelCosts> = {
     COST_TIER_5_25,
   [firstPartyNameToCanonical(CLAUDE_OPUS_5_CONFIG.firstParty)]:
     COST_TIER_5_25,
+  // gacbert: Fable 5 and 5.1 both canonicalize to `claude-fable` and share the
+  // $10/$50 tier. Without an entry they fall to DEFAULT_UNKNOWN_MODEL_COST
+  // ($5/$25), under-reporting spend by 2x. COST_TIER_10_50's cache write rates
+  // are the standard multiples of a $10 input tier; note Fable 5.1's published
+  // cache READ rate is $0.25/Mtok rather than this tier's $1.00, so cache-read
+  // cost is over-reported. Input/output — the dominant terms — are exact.
+  'claude-fable': COST_TIER_10_50,
 }
 
 /**

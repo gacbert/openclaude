@@ -1,6 +1,34 @@
 import { defineModel } from '../define.js'
 
 export default [
+  // gacbert: Fable 5.1. Unreachable on the anthropic-native transport (that
+  // route short-circuits before the integration catalog), so this is for
+  // catalog honesty and any future OpenAI-compatible/proxy route — the
+  // functional gates live in utils/{context,effort,thinking,betas}.ts.
+  defineModel({
+    id: 'claude-fable-5-1',
+    label: 'Claude Fable 5.1',
+    brandId: 'claude',
+    vendorId: 'anthropic',
+    classification: ['chat', 'reasoning', 'vision', 'coding'],
+    defaultModel: 'claude-fable-5-1',
+    capabilities: {
+      supportsVision: true,
+      supportsStreaming: true,
+      supportsFunctionCalling: true,
+      supportsJsonMode: true,
+      supportsReasoning: true,
+      supportsPreciseTokenCount: false,
+    },
+    reasoning: {
+      mode: 'levels',
+      levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      wireFormat: 'reasoning_effort',
+      disableFormat: 'thinking_type_disabled',
+    },
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+  }),
   defineModel({
     id: 'claude-opus-5',
     label: 'Claude Opus 5',

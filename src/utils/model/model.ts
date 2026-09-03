@@ -704,6 +704,14 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
     case getModelStrings().opus50 + '[1m]':
     case getModelStrings().opus50:
       return 'Opus 5'
+    // gacbert: Fable is not in getModelStrings(); match the ids literally.
+    // Both the bare and [1m]-tagged spellings reach here.
+    case 'claude-fable-5-1[1m]':
+    case 'claude-fable-5-1':
+      return 'Fable 5.1'
+    case 'claude-fable-5[1m]':
+    case 'claude-fable-5':
+      return 'Fable 5'
     case getModelStrings().opus48 + '[1m]':
       return 'Opus 4.8 (1M context)'
     case getModelStrings().opus48:

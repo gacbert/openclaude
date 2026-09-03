@@ -188,6 +188,16 @@ export function modelUsesDefault1MContext(model: string): boolean {
       getAPIProvider() === 'firstParty' && isFirstPartyAnthropicBaseUrl()
     )
   }
+  // gacbert: Fable 5 / 5.1 are natively 1M on the first-party API. Without
+  // this the CLI falls through to the 200k MODEL_CONTEXT_WINDOW_DEFAULT and
+  // compacts ~5x early, which is why the Telegram bot has to pin the
+  // `claude-fable-5-1[1m]` id. Listing it here also stops betas.ts from
+  // attaching `context-1m-2025-08-07` to a model that does not need it.
+  if (canonical.includes('claude-fable')) {
+    return (
+      getAPIProvider() === 'firstParty' && isFirstPartyAnthropicBaseUrl()
+    )
+  }
   return canonical.includes('opus-4-8')
 }
 
@@ -424,6 +434,8 @@ export function getModelMaxOutputTokens(model: string): {
   if (
     m.includes('claude-opus-5') ||
     m.includes('claude-sonnet-5') ||
+    // gacbert: Fable 5 / 5.1 support 128k output like the Claude 5 family.
+    m.includes('claude-fable') ||
     m.includes('opus-4-8') ||
     m.includes('opus-4-7') ||
     m.includes('opus-4-6')
