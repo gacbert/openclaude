@@ -365,7 +365,7 @@ export function buildCurrentProviderSummary(options?: {
     modelLabel: getSafeDisplayValue(
       processEnv.ANTHROPIC_MODEL ??
         processEnv.CLAUDE_MODEL ??
-        'claude-sonnet-4-6',
+        'claude-sonnet-5',
       secretSource,
     ),
     endpointLabel: getSafeDisplayValue(

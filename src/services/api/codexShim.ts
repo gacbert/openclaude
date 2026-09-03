@@ -903,6 +903,7 @@ export async function* codexStreamToAnthropic(
     { index: number; toolUseId: string; emittedArgs: string }
   >()
   let activeTextBlockIndex: number | null = null
+  let activeRawText = ''
   const thinkFilter = createThinkTagFilter()
   let nextContentBlockIndex = 0
   let sawToolUse = false
@@ -933,6 +934,7 @@ export async function* codexStreamToAnthropic(
       index: activeTextBlockIndex,
     }
     activeTextBlockIndex = null
+    activeRawText = ''
   }
 
   const startTextBlockIfNeeded = async function* () {
@@ -943,6 +945,37 @@ export async function* codexStreamToAnthropic(
       type: 'content_block_start',
       index: activeTextBlockIndex,
       content_block: { type: 'text', text: '' },
+    }
+  }
+
+  const appendCompletedText = async function* (value: unknown) {
+    const completedText = typeof value === 'string' ? value : ''
+    if (!completedText) return
+
+    // Responses normally streams the whole value through output_text.delta,
+    // then repeats it on output_text.done/output_item.done. Some Codex model
+    // paths only send the terminal copy. Emit only the missing suffix so both
+    // delivery styles produce exactly one Anthropic text block.
+    if (activeRawText && !completedText.startsWith(activeRawText)) return
+    const missingText = completedText.slice(activeRawText.length)
+    if (!missingText) return
+
+    yield* startTextBlockIfNeeded()
+    activeRawText = completedText
+    if (activeTextBlockIndex !== null) {
+      throwIfStreamAborted(signal)
+      const visible = thinkFilter.feed(missingText)
+      if (visible) {
+        throwIfStreamAborted(signal)
+        yield {
+          type: 'content_block_delta',
+          index: activeTextBlockIndex,
+          delta: {
+            type: 'text_delta',
+            text: visible,
+          },
+        }
+      }
     }
   }
 
@@ -1021,7 +1054,10 @@ export async function* codexStreamToAnthropic(
         yield* startTextBlockIfNeeded()
         if (activeTextBlockIndex !== null) {
           throwIfStreamAborted(signal)
-          const visible = thinkFilter.feed(payload.delta ?? '')
+          const rawDelta =
+            typeof payload.delta === 'string' ? payload.delta : ''
+          activeRawText += rawDelta
+          const visible = thinkFilter.feed(rawDelta)
           if (visible) {
             throwIfStreamAborted(signal)
             yield {
@@ -1034,6 +1070,11 @@ export async function* codexStreamToAnthropic(
             }
           }
         }
+        continue
+      }
+
+      if (event.event === 'response.output_text.done') {
+        yield* appendCompletedText(payload.text)
         continue
       }
 
@@ -1114,6 +1155,16 @@ export async function* codexStreamToAnthropic(
             toolBlocksByItemId.delete(String(item.id))
           }
         } else if (item?.type === 'message') {
+          const completedText = Array.isArray(item.content)
+            ? item.content
+              .filter(
+                (part: { type?: string }) => part?.type === 'output_text',
+              )
+              .map((part: { text?: unknown }) =>
+                typeof part.text === 'string' ? part.text : '')
+              .join('')
+            : ''
+          yield* appendCompletedText(completedText)
           yield* closeActiveTextBlock()
         }
         continue

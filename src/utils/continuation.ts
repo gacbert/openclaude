@@ -68,10 +68,19 @@ const VERB_ING = ACTION_VERBS.map(v => {
   return v.replace(/e$/, '') + 'ing'
 }).join('|')
 
+// Verb list for the SUBJECT-LESS imperative patterns. "go" is dropped:
+// bare "now go <verb>" is only ever a directive aimed at a person ("now go
+// finish Section 3"), never an agent narrating its own next step — that
+// shape is first-person ("now I'll go check the logs") and is still caught
+// by the `now i('ll| will)` and `i (will|need to|…)` signals above. Left in
+// VERB_ALT so those subject-bearing patterns keep matching it.
+export const VERB_ALT_IMPERATIVE = ACTION_VERBS.filter(a => a !== 'go').join('|')
+
 // Build continuation-signal regexes from the shared verb list.
 // (Using function to keep construction readable.)
 function buildContinuationSignals(): RegExp[] {
   const v = VERB_ALT
+  const vImperative = VERB_ALT_IMPERATIVE
   // "time to" needs "do" explicitly, but the rest of the verb list without "do"
   // (use filtered array instead of string.replace so reordering ACTION_VERBS doesn't break it)
   const vWithoutDo = ACTION_VERBS.filter(a => a !== 'do').join('|')
@@ -82,7 +91,11 @@ function buildContinuationSignals(): RegExp[] {
     new RegExp(`\\bi (will|shall|now|need to|have to|must|should) (now )?(${v})\\b`, 'i'),
     new RegExp(`\\blet me (go ahead and |now )?(${v})\\b`, 'i'),
     new RegExp(`\\btime to (do|${vWithoutDo}|get started|begin|start)\\b`, 'i'),
-    new RegExp(`\\b(moving on to|next step is to|starting to|proceeding to|continuing with|applying (the|these) changes|${VERB_ING})\\b`, 'i'),
+    new RegExp(`\\b(moving on to|next step is to|starting to|proceeding to|continuing with|applying (the|these) changes)\\b`, 'i'),
+    // A bare gerund ("useful for generating data") describes content, not
+    // agent intent. Require the explicit transition word used by the
+    // present-progressive fallback below.
+    new RegExp(`\\bnow (${VERB_ING})\\b`, 'i'),
     // French: Support for common continuation phrasing (relaxed boundaries for accents and apostrophes)
     /(^|\s)(je passe (à|au)|ensuite|l'étape suivante est de|je continue avec|au suivant|passons à|je reviens vers vous|je suis en train d'|je vais maintenant)(\s|$|[a-zà-ÿ])/i,
     /(^|\s)(je (vais|dois|dois maintenant|vais maintenant) (faire|créer|écrire|modifier|ajouter|tester|vérifier|lancer|exécuter|procéder|démarrer|commencer|identifier|analyser|inspecter|revoir|chercher))(\s|$|[a-zà-ÿ])/i,
@@ -93,7 +106,7 @@ function buildContinuationSignals(): RegExp[] {
     /◻/,
     // Imperative/declarative patterns (no subject required)
     new RegExp(`(?<!\\b(?:you|i|we|they|he|she|it)\\s+)\\bneed to (${v})\\b`, 'i'),
-    new RegExp(`\\bnow (${v})\\b(?!\\s+you\\b)`, 'i'),
+    new RegExp(`\\bnow (${vImperative})\\b(?!\\s+you\\b)`, 'i'),
     new RegExp(`\\bnext (i|we)\\s+(need to|will|shall|should|must)?\\s*(${v})\\b`, 'i'),
   ]
 }
@@ -101,6 +114,14 @@ function buildContinuationSignals(): RegExp[] {
 export const CONTINUATION_SIGNALS = buildContinuationSignals()
 
 export const COMPLETION_MARKERS = /\b(done|finished|completed|complete|summary|that's all|that is all|all set|hope this helps|let me know if|no issues|lgtm)\b/i
+
+/**
+ * The continuation request is synthetic, so it must identify the logical turn
+ * it belongs to. A generic "continue" can otherwise reactivate an older task
+ * when a resumed session contains automation history.
+ */
+export const CONTINUATION_NUDGE_MESSAGE =
+  "Continue with the current user's latest request only. If that request is already fully answered, stop. Do not resume any earlier task, automation, or objective from the conversation history."
 
 export type ContinuationResult = {
   shouldNudge: boolean
@@ -114,8 +135,9 @@ export const UNFINISHED_SENTIMENT_SIGNALS = [
   /\b(et|avec|le|la|les|un|une|de|du|des|pour|au|aux|dans|sur|par|à|en|si|car|mais|ou|donc|ni|que|ce|ma|ta|sa|mes|tes|ses|notre|votre|leur|nos|vos|leurs)\s*$/i,
   // Trailing non-terminal punctuation
   /[,;]\s*$/,
-  // Unclosed code block starter
-  /```[a-z]*\s*$/i,
+  // A trailing fence is NOT a signal on its own: it matches the closing fence
+  // of a complete block just as readily as a truncated opening one. Fence
+  // truncation is decided by the ``` parity check in analyzeContinuationIntent.
 ]
 
 /**
@@ -183,7 +205,7 @@ export function analyzeContinuationIntent(
       // (e.g. "Need to process files.", "Now create the component.", "Next we need to add tests.")
       // Use lateText (last 120 chars) for consistency with the late-window intent check above.
       const hasImperativeSignal = new RegExp(`(?<!\\b(?:you|i|we|they|he|she|it)\\s+)\\bneed to (?:${VERB_ALT})\\b`, 'i').test(lateText) ||
-        new RegExp(`\\bnow (?:${VERB_ALT})\\b(?!\\s+you\\b)`, 'i').test(lateText) ||
+        new RegExp(`\\bnow (?:${VERB_ALT_IMPERATIVE})\\b(?!\\s+you\\b)`, 'i').test(lateText) ||
         new RegExp(`\\bnext (?:i|we)\\s+(?:need to|will|shall|should|must)?\\s*(?:${VERB_ALT})\\b`, 'i').test(lateText)
       const endsWithColon = /:\s*$/.test(lastText)
       if (strongIntent || endsWithColon || presentProgressive || hasImperativeSignal) {

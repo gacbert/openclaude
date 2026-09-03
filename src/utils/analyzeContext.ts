@@ -18,6 +18,7 @@ import {
 import {
   countMessagesTokensWithAPI,
   countTokensViaHaikuFallback,
+  getBytesPerTokenForModel,
   roughTokenCountEstimation,
   roughTokenCountEstimationForMessages,
 } from '../services/tokenEstimation.js'
@@ -78,6 +79,7 @@ export const TOOL_TOKEN_COUNT_OVERHEAD = 500
 async function countTokensWithFallback(
   messages: Anthropic.Beta.Messages.BetaMessageParam[],
   tools: Anthropic.Beta.Messages.BetaToolUnion[],
+  model?: string,
 ): Promise<number | null> {
   try {
     const result = await countMessagesTokensWithAPI(messages, tools)
@@ -107,22 +109,26 @@ async function countTokensWithFallback(
     logError(err)
   }
 
-  return estimateTokensLocally(messages, tools)
+  return estimateTokensLocally(messages, tools, model)
 }
 
 function estimateTokensLocally(
   messages: Anthropic.Beta.Messages.BetaMessageParam[],
   tools: Anthropic.Beta.Messages.BetaToolUnion[],
+  model?: string,
 ): number {
+  const bytesPerToken = model ? getBytesPerTokenForModel(model) : 4
   const messageTokens = roughTokenCountEstimationForMessages(
     messages.map(message => ({
       type: message.role,
       message: { content: message.content },
     })),
+    bytesPerToken,
   )
   const toolTokens =
     tools.length > 0
-      ? TOOL_TOKEN_COUNT_OVERHEAD + roughTokenCountEstimation(jsonStringify(tools))
+      ? TOOL_TOKEN_COUNT_OVERHEAD +
+        roughTokenCountEstimation(jsonStringify(tools), bytesPerToken)
       : 0
 
   return messageTokens + toolTokens
@@ -267,7 +273,7 @@ export async function countToolDefinitionTokens(
       }),
     ),
   )
-  const result = await countTokensWithFallback([], toolSchemas)
+  const result = await countTokensWithFallback([], toolSchemas, model)
   if (result === null || result === 0) {
     const toolNames = tools.map(t => t.name).join(', ')
     logForDebugging(
@@ -291,6 +297,7 @@ function extractSectionName(content: string): string {
 
 async function countSystemTokens(
   effectiveSystemPrompt: readonly string[],
+  model?: string,
 ): Promise<{
   systemPromptTokens: number
   systemPromptSections: SystemPromptSectionDetail[]
@@ -318,7 +325,7 @@ async function countSystemTokens(
 
   const systemTokenCounts = await Promise.all(
     namedEntries.map(({ content }) =>
-      countTokensWithFallback([{ role: 'user', content }], []),
+      countTokensWithFallback([{ role: 'user', content }], [], model),
     ),
   )
 
@@ -337,7 +344,7 @@ async function countSystemTokens(
   return { systemPromptTokens, systemPromptSections }
 }
 
-async function countMemoryFileTokens(): Promise<{
+async function countMemoryFileTokens(model?: string): Promise<{
   memoryFileDetails: MemoryFile[]
   claudeMdTokens: number
 }> {
@@ -362,6 +369,7 @@ async function countMemoryFileTokens(): Promise<{
       const tokens = await countTokensWithFallback(
         [{ role: 'user', content: file.content }],
         [],
+        model,
       )
 
       return { file, tokens: tokens || 0 }
@@ -542,6 +550,7 @@ async function countSlashCommandTokens(
   tools: Tools,
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
   agentInfo: AgentDefinitionsResult | null,
+  model?: string,
 ): Promise<{
   slashCommandTokens: number
   commandInfo: { totalCommands: number; includedCommands: number }
@@ -560,6 +569,7 @@ async function countSlashCommandTokens(
     [slashCommandTool],
     getToolPermissionContext,
     agentInfo,
+    model,
   )
 
   return {
@@ -575,6 +585,7 @@ async function countSkillTokens(
   tools: Tools,
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
   agentInfo: AgentDefinitionsResult | null,
+  model?: string,
 ): Promise<{
   skillTokens: number
   skillInfo: {
@@ -602,6 +613,7 @@ async function countSkillTokens(
       [slashCommandTool],
       getToolPermissionContext,
       agentInfo,
+      model,
     )
 
     // Calculate per-skill token estimates based on frontmatter only
@@ -751,9 +763,10 @@ export async function countMcpToolTokens(
   }
 }
 
-async function countCustomAgentTokens(agentDefinitions: {
-  activeAgents: AgentDefinition[]
-}): Promise<{
+async function countCustomAgentTokens(
+  agentDefinitions: { activeAgents: AgentDefinition[] },
+  model?: string,
+): Promise<{
   agentTokens: number
   agentDetails: Agent[]
 }> {
@@ -773,6 +786,7 @@ async function countCustomAgentTokens(agentDefinitions: {
           },
         ],
         [],
+        model,
       ),
     ),
   )
@@ -804,10 +818,15 @@ type MessageBreakdown = {
 function processAssistantMessage(
   msg: AssistantMessage | NormalizedAssistantMessage,
   breakdown: MessageBreakdown,
+  bytesPerToken: number,
 ): void {
   // Process each content block individually
   for (const block of msg.message.content) {
-    const blockTokens = estimateMessageBlockTokens('assistant', block)
+    const blockTokens = estimateMessageBlockTokens(
+      'assistant',
+      block,
+      bytesPerToken,
+    )
 
     if ('type' in block && block.type === 'tool_use') {
       breakdown.toolCallTokens += blockTokens
@@ -827,18 +846,26 @@ function processUserMessage(
   msg: UserMessage | NormalizedUserMessage,
   breakdown: MessageBreakdown,
   toolUseIdToName: Map<string, string>,
+  bytesPerToken: number,
 ): void {
   // Handle both string and array content
   if (typeof msg.message.content === 'string') {
     // Simple string content
-    const tokens = roughTokenCountEstimation(msg.message.content)
+    const tokens = roughTokenCountEstimation(
+      msg.message.content,
+      bytesPerToken,
+    )
     breakdown.userMessageTokens += tokens
     return
   }
 
   // Process each content block individually
   for (const block of msg.message.content) {
-    const blockTokens = estimateMessageBlockTokens('user', block)
+    const blockTokens = estimateMessageBlockTokens(
+      'user',
+      block,
+      bytesPerToken,
+    )
 
     if ('type' in block && block.type === 'tool_result') {
       breakdown.toolResultTokens += blockTokens
@@ -877,20 +904,25 @@ function isInlineMediaBlock(block: unknown): block is { type: string } {
 function estimateMessageBlockTokens(
   role: 'assistant' | 'user',
   block: unknown,
+  bytesPerToken: number,
 ): number {
-  return roughTokenCountEstimationForMessages([
-    {
-      type: role,
-      message: { content: [block] },
-    },
-  ])
+  return roughTokenCountEstimationForMessages(
+    [
+      {
+        type: role,
+        message: { content: [block] },
+      },
+    ],
+    bytesPerToken,
+  )
 }
 
 function processAttachment(
   msg: AttachmentMessage,
   breakdown: MessageBreakdown,
+  bytesPerToken: number,
 ): void {
-  const tokens = roughTokenCountEstimationForMessages([msg])
+  const tokens = roughTokenCountEstimationForMessages([msg], bytesPerToken)
   breakdown.attachmentTokens += tokens
   const attachType = msg.attachment.type || 'unknown'
   breakdown.attachmentsByType.set(
@@ -901,8 +933,10 @@ function processAttachment(
 
 async function approximateMessageTokens(
   messages: Message[],
+  model?: string,
 ): Promise<MessageBreakdown> {
   const microcompactResult = await microcompactMessages(messages)
+  const bytesPerToken = model ? getBytesPerTokenForModel(model) : 4
 
   // Initialize tracking
   const breakdown: MessageBreakdown = {
@@ -937,11 +971,11 @@ async function approximateMessageTokens(
   // Process each message for detailed breakdown
   for (const msg of microcompactResult.messages) {
     if (msg.type === 'assistant') {
-      processAssistantMessage(msg, breakdown)
+      processAssistantMessage(msg, breakdown, bytesPerToken)
     } else if (msg.type === 'user') {
-      processUserMessage(msg, breakdown, toolUseIdToName)
+      processUserMessage(msg, breakdown, toolUseIdToName, bytesPerToken)
     } else if (msg.type === 'attachment') {
-      processAttachment(msg, breakdown)
+      processAttachment(msg, breakdown, bytesPerToken)
     }
   }
 
@@ -958,6 +992,7 @@ async function approximateMessageTokens(
       return _.message
     }),
     [],
+    model,
   )
 
   breakdown.totalTokens = approximateMessageTokens ?? 0
@@ -966,8 +1001,9 @@ async function approximateMessageTokens(
 
 export async function approximateMessageTokensForTesting(
   messages: Message[],
+  model?: string,
 ): Promise<MessageBreakdown> {
-  return approximateMessageTokens(messages)
+  return approximateMessageTokens(messages, model)
 }
 
 export async function analyzeContextUsage(
@@ -1016,8 +1052,8 @@ export async function analyzeContextUsage(
     { slashCommandTokens, commandInfo },
     messageBreakdown,
   ] = await Promise.all([
-    countSystemTokens(effectiveSystemPrompt),
-    countMemoryFileTokens(),
+    countSystemTokens(effectiveSystemPrompt, runtimeModel),
+    countMemoryFileTokens(runtimeModel),
     countBuiltInToolTokens(
       tools,
       getToolPermissionContext,
@@ -1032,9 +1068,14 @@ export async function analyzeContextUsage(
       runtimeModel,
       messages,
     ),
-    countCustomAgentTokens(agentDefinitions),
-    countSlashCommandTokens(tools, getToolPermissionContext, agentDefinitions),
-    approximateMessageTokens(messages),
+    countCustomAgentTokens(agentDefinitions, runtimeModel),
+    countSlashCommandTokens(
+      tools,
+      getToolPermissionContext,
+      agentDefinitions,
+      runtimeModel,
+    ),
+    approximateMessageTokens(messages, runtimeModel),
   ])
 
   // Count skills separately with error isolation
@@ -1042,6 +1083,7 @@ export async function analyzeContextUsage(
     tools,
     getToolPermissionContext,
     agentDefinitions,
+    runtimeModel,
   )
   const skillInfo = skillResult.skillInfo
   // Use sum of individual skill token estimates (matches what's shown in details)

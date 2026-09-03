@@ -5,7 +5,7 @@ export default defineVendor({
   label: 'OpenAI',
   classification: 'openai-compatible',
   defaultBaseUrl: 'https://api.openai.com/v1',
-  defaultModel: 'gpt-5.4',
+  defaultModel: 'gpt-5.6-terra',
   requiredEnvVars: ['OPENAI_API_KEYS', 'OPENAI_API_KEY'],
   setup: {
     requiresAuth: true,

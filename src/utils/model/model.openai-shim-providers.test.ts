@@ -417,7 +417,75 @@ test('custom Anthropic endpoints retain their configured model and conservative 
 
   expect(getSmallFastModel()).toBe('tenant-model')
   expect(getDefaultOpusModel()).toBe('claude-opus-4-7')
-  expect(getDefaultSonnetModel()).toBe('claude-sonnet-4-5-20250929')
+  expect(getDefaultSonnetModel()).toBe('claude-sonnet-4-6')
+})
+
+test('first-party Claude aliases resolve to native-1M Claude 5 models', async () => {
+  delete process.env.ANTHROPIC_BASE_URL
+
+  const { getDefaultOpusModel, getDefaultSonnetModel, parseUserSpecifiedModel } =
+    await importFreshModelModule()
+
+  expect(getDefaultOpusModel()).toBe('claude-opus-5')
+  expect(getDefaultSonnetModel()).toBe('claude-sonnet-5')
+  expect(parseUserSpecifiedModel('opus')).toBe('claude-opus-5')
+  expect(parseUserSpecifiedModel('opus[1m]')).toBe('claude-opus-5')
+  expect(parseUserSpecifiedModel('sonnet')).toBe('claude-sonnet-5')
+  expect(parseUserSpecifiedModel('sonnet[1m]')).toBe('claude-sonnet-5')
+})
+
+test('built-in third-party Sonnet aliases remain on their conservative release', async () => {
+  process.env.CLAUDE_CODE_USE_BEDROCK = '1'
+  let modelModule = await importFreshModelModule()
+  expect(modelModule.getDefaultSonnetModel()).toBe(
+    'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+  )
+
+  delete process.env.CLAUDE_CODE_USE_BEDROCK
+  process.env.CLAUDE_CODE_USE_VERTEX = '1'
+  resetStateForTests()
+  modelModule = await importFreshModelModule()
+  expect(modelModule.getDefaultSonnetModel()).toBe(
+    'claude-sonnet-4-5@20250929',
+  )
+
+  delete process.env.CLAUDE_CODE_USE_VERTEX
+  process.env.CLAUDE_CODE_USE_FOUNDRY = '1'
+  resetStateForTests()
+  modelModule = await importFreshModelModule()
+  expect(modelModule.getDefaultSonnetModel()).toBe('claude-sonnet-4-5')
+})
+
+test('Bedrock and Vertex Opus aliases resolve to Opus 5 compatibility IDs', async () => {
+  process.env.CLAUDE_CODE_USE_BEDROCK = '1'
+  let modelModule = await importFreshModelModule()
+  expect(modelModule.getDefaultOpusModel()).toBe(
+    'us.anthropic.claude-opus-5',
+  )
+  expect(modelModule.parseUserSpecifiedModel('opus[1m]')).toBe(
+    'us.anthropic.claude-opus-5[1m]',
+  )
+
+  delete process.env.CLAUDE_CODE_USE_BEDROCK
+  process.env.CLAUDE_CODE_USE_VERTEX = '1'
+  resetStateForTests()
+  modelModule = await importFreshModelModule()
+  expect(modelModule.getDefaultOpusModel()).toBe('claude-opus-5')
+  expect(modelModule.parseUserSpecifiedModel('opus[1m]')).toBe(
+    'claude-opus-5[1m]',
+  )
+})
+
+test('Foundry and custom gateways retain conservative Opus aliases', async () => {
+  process.env.CLAUDE_CODE_USE_FOUNDRY = '1'
+  let modelModule = await importFreshModelModule()
+  expect(modelModule.getDefaultOpusModel()).toBe('claude-opus-4-6')
+
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
+  process.env.ANTHROPIC_BASE_URL = 'https://tenant.example'
+  resetStateForTests()
+  modelModule = await importFreshModelModule()
+  expect(modelModule.getDefaultOpusModel()).toBe('claude-opus-4-7')
 })
 
 test('default helpers do not leak claude-* names to shim providers', async () => {

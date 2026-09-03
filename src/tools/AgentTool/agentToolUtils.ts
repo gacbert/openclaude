@@ -59,6 +59,7 @@ import { getTokenCountFromUsage } from '../../utils/tokens.js'
 import { EXIT_PLAN_MODE_V2_TOOL_NAME } from '../ExitPlanModeTool/constants.js'
 import { AGENT_TOOL_NAME, LEGACY_AGENT_TOOL_NAME } from './constants.js'
 import type { AgentDefinition } from './loadAgentsDir.js'
+import { filterRootOnlyMcpToolsForAgent } from './rootOnlyMcpTools.js'
 export type ResolvedAgentTools = {
   hasWildcard: boolean
   validTools: string[]
@@ -78,7 +79,7 @@ export function filterToolsForAgent({
   isAsync?: boolean
   permissionMode?: PermissionMode
 }): Tools {
-  return tools.filter(tool => {
+  return filterRootOnlyMcpToolsForAgent(tools).filter(tool => {
     // Allow MCP tools for all agents
     if (tool.name.startsWith('mcp__')) {
       return true

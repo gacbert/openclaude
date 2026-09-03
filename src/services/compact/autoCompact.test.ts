@@ -314,10 +314,13 @@ describe('getAutoCompactThreshold', () => {
     expect(threshold).toBeGreaterThan(0)
   })
 
-  test('keeps claude opus 4.8 auto-compact threshold near the 1M window', async () => {
+  test('keeps native 1M Claude auto-compact thresholds near the 1M window', async () => {
     const { getAutoCompactThreshold } = await importAutoCompact()
 
-    expect(getAutoCompactThreshold('claude-opus-4-8')).toBe(967_000)
+    // 1M context - 20k summary reservation - 30k compaction buffer.
+    expect(getAutoCompactThreshold('claude-opus-5')).toBe(950_000)
+    expect(getAutoCompactThreshold('claude-sonnet-5')).toBe(950_000)
+    expect(getAutoCompactThreshold('claude-opus-4-8')).toBe(950_000)
   })
 
   test('never returns negative threshold even for unknown 3P models (issue #635)', async () => {

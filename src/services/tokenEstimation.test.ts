@@ -1,7 +1,11 @@
 import type { Anthropic } from '@anthropic-ai/sdk'
 import { expect, mock, test } from 'bun:test'
 import { jsonStringify } from '../utils/slowOperations.js'
-import { __test, roughTokenCountEstimation } from './tokenEstimation.js'
+import {
+  __test,
+  getBytesPerTokenForModel,
+  roughTokenCountEstimation,
+} from './tokenEstimation.js'
 
 function createTextTool(): Anthropic.Beta.Messages.BetaToolUnion {
   return {
@@ -77,4 +81,45 @@ test('countMessagesTokensWithClient uses countTokens when the client supports it
     tools: [],
   })
   expect(result).toBe(42)
+})
+
+test('Sonnet 5 token counting uses adaptive thinking instead of a manual budget', async () => {
+  const countTokens = mock(async (_params: unknown) => ({ input_tokens: 42 }))
+
+  await __test.countMessagesTokensWithClient({
+    messagesClient: {
+      countTokens:
+        countTokens as unknown as Anthropic['beta']['messages']['countTokens'],
+    },
+    model: 'claude-sonnet-5',
+    messages: [{ role: 'user', content: 'count adaptive thinking' }],
+    tools: [],
+    filteredBetas: [],
+    containsThinking: true,
+  })
+
+  expect(countTokens.mock.calls[0]?.[0]).toMatchObject({
+    model: 'claude-sonnet-5',
+    thinking: { type: 'adaptive' },
+  })
+  expect(__test.getTokenCountingThinkingConfig('claude-sonnet-4-6')).toEqual({
+    type: 'enabled',
+    budget_tokens: 1024,
+  })
+})
+
+test('Sonnet 5 uses its conservative tokenizer ratio in the real fallback', async () => {
+  expect(getBytesPerTokenForModel('claude-sonnet-5')).toBe(2.7)
+  expect(getBytesPerTokenForModel('claude-sonnet-4-6')).toBe(3.5)
+
+  const content = 'sonnet five fallback token estimate'
+  const result = await __test.countMessagesTokensWithClient({
+    messagesClient: {},
+    model: 'claude-sonnet-5',
+    messages: [{ role: 'user', content }],
+    tools: [],
+    filteredBetas: [],
+    containsThinking: false,
+  })
+  expect(result).toBe(roughTokenCountEstimation(content, 2.7))
 })

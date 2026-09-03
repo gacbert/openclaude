@@ -16,9 +16,9 @@ afterEach(() => {
   }
 })
 
-async function importFreshTeammateModelModule(provider = 'mistral') {
-  mock.module('../model/providers.js', () => ({
-    getAPIProvider: () => provider,
+async function importFreshTeammateModelModule(defaultOpusModel: string) {
+  mock.module('../model/model.js', () => ({
+    getDefaultOpusModel: () => defaultOpusModel,
   }))
   const nonce = `${Date.now()}-${Math.random()}`
   return import(`./teammateModel.js?ts=${nonce}`)
@@ -26,25 +26,25 @@ async function importFreshTeammateModelModule(provider = 'mistral') {
 
 test('getHardcodedTeammateModelFallback returns a Mistral fallback in mistral mode', async () => {
   const { getHardcodedTeammateModelFallback } =
-    await importFreshTeammateModelModule()
+    await importFreshTeammateModelModule('devstral-latest')
 
   expect(getHardcodedTeammateModelFallback()).toBe('devstral-latest')
 })
 
-test('getHardcodedTeammateModelFallback returns the current default Opus (4.8) for first party', async () => {
+test('getHardcodedTeammateModelFallback returns the current default Opus (5) for first party', async () => {
   // Regression for #1769: the fallback hardcoded Opus 4.6 while the default Opus
-  // is now 4.8, so new teammates spawned on an older model.
+  // is now Opus 5, so new teammates spawned on an older model.
   const { getHardcodedTeammateModelFallback } =
-    await importFreshTeammateModelModule('firstParty')
+    await importFreshTeammateModelModule('claude-opus-5')
 
-  expect(getHardcodedTeammateModelFallback()).toBe('claude-opus-4-8')
+  expect(getHardcodedTeammateModelFallback()).toBe('claude-opus-5')
 })
 
-test('getHardcodedTeammateModelFallback is provider-aware (Bedrock gets the Opus 4.8 Bedrock id)', async () => {
+test('getHardcodedTeammateModelFallback preserves the provider-aware model ID', async () => {
   const { getHardcodedTeammateModelFallback } =
-    await importFreshTeammateModelModule('bedrock')
+    await importFreshTeammateModelModule('us.anthropic.claude-opus-5')
 
   expect(getHardcodedTeammateModelFallback()).toBe(
-    'us.anthropic.claude-opus-4-8-v1',
+    'us.anthropic.claude-opus-5',
   )
 })

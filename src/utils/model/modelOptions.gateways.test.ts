@@ -44,6 +44,8 @@ const originalEnv = {
   ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
   ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL,
   ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+  ANTHROPIC_DEFAULT_SONNET_MODEL:
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL,
   OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
   ATLAS_CLOUD_API_KEY: process.env.ATLAS_CLOUD_API_KEY,
   CODEX_API_KEY: process.env.CODEX_API_KEY,
@@ -126,6 +128,66 @@ test('custom Anthropic endpoints use the third-party default description', async
 
   expect(defaultOption?.description).toContain('currently proxy-model')
   expect(defaultOption?.description).not.toContain('$')
+})
+
+test('first-party picker exposes Claude 5 defaults without redundant 1M variants', async () => {
+  process.env.ANTHROPIC_API_KEY = 'sk-ant-test'
+
+  const { getModelOptions } = await importFreshModelOptionsModule(
+    'firstParty',
+    true,
+  )
+  const options = getModelOptions()
+  const defaultOption = options.find(option => option.value === null)
+  const opus = options.find(option => option.value === 'opus')
+
+  expect(defaultOption?.description).toContain('Sonnet 5')
+  expect(opus?.description).toContain('Opus 5')
+  expect(opus?.description).toContain('1M context')
+  expect(options.map(option => option.value)).not.toContain('claude-opus-4-8')
+  expect(options.map(option => option.value)).not.toContain('claude-opus-4-7')
+  expect(options.map(option => option.value)).not.toContain('opus[1m]')
+  expect(options.map(option => option.value)).not.toContain('sonnet[1m]')
+})
+
+test('first-party PAYG picker prices the resolved default instead of hardcoding Sonnet 5', async () => {
+  process.env.ANTHROPIC_API_KEY = 'sk-ant-test'
+  process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'claude-opus-5'
+
+  const { getModelOptions } = await importFreshModelOptionsModule(
+    'firstParty',
+    true,
+  )
+  const defaultOption = getModelOptions().find(option => option.value === null)
+
+  expect(defaultOption?.description).toContain('Opus 5')
+  expect(defaultOption?.description).toContain('$5/$25 per Mtok')
+})
+
+test('Bedrock picker resolves the Opus alias to Opus 5', async () => {
+  const modelOptions = await importFreshModelOptionsModule('bedrock')
+  const options = modelOptions.getModelOptions()
+  const opus = options.find(option => option.value === 'opus')
+  expect(opus?.description).toContain('Opus 5')
+  expect(options.map(option => option.value)).not.toContain('claude-opus-4-8')
+  expect(options.map(option => option.value)).not.toContain('claude-opus-4-7')
+})
+
+test('Vertex picker resolves the Opus alias to Opus 5', async () => {
+  const modelOptions = await importFreshModelOptionsModule('vertex')
+  const options = modelOptions.getModelOptions()
+  const opus = options.find(option => option.value === 'opus')
+  expect(opus?.description).toContain('Opus 5')
+  expect(options.map(option => option.value)).not.toContain('claude-opus-4-8')
+  expect(options.map(option => option.value)).not.toContain('claude-opus-4-7')
+})
+
+test('Foundry picker retains the built-in Opus 4.6 alias', async () => {
+  const modelOptions = await importFreshModelOptionsModule('foundry')
+  const opus = modelOptions
+    .getModelOptions()
+    .find(option => option.value === 'opus')
+  expect(opus?.description).toContain('Opus 4.6')
 })
 
 test('OpenRouter active profile cache merges with the static route catalog', async () => {

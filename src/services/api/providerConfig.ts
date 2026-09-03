@@ -79,18 +79,12 @@ const CODEX_ALIAS_MODELS: Record<
   }
 > = {
   codexplan: {
-    model: 'gpt-5.5',
-    reasoningEffort: 'high',
-  },
-  // GPT-5.6 family (July 2026). `gpt-5.6` follows the Codex CLI convention of
-  // resolving the bare version to the flagship tier (Sol).
-  'gpt-5.6': {
-    model: 'gpt-5.6-sol',
-    reasoningEffort: 'high',
+    model: 'gpt-5.6-terra',
+    reasoningEffort: 'medium',
   },
   'gpt-5.6-sol': {
     model: 'gpt-5.6-sol',
-    reasoningEffort: 'high',
+    reasoningEffort: 'low',
   },
   'gpt-5.6-terra': {
     model: 'gpt-5.6-terra',
@@ -99,6 +93,12 @@ const CODEX_ALIAS_MODELS: Record<
   'gpt-5.6-luna': {
     model: 'gpt-5.6-luna',
     reasoningEffort: 'medium',
+  },
+  // GPT-5.6 family (July 2026). `gpt-5.6` follows the Codex CLI convention of
+  // resolving the bare version to the flagship tier (Sol).
+  'gpt-5.6': {
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'high',
   },
   'gpt-5.5': {
     model: 'gpt-5.5',
@@ -1508,13 +1508,17 @@ export function supportsCodexReasoningEffort(model: string): boolean {
 
 // gacbert patch: Codex "Fast" speed tier. The ChatGPT Codex /responses backend
 // exposes a `priority` service tier (its UI display name is "Fast"; ~1.5x speed,
-// increased usage) for gpt-5.5 / gpt-5.4 ONLY. spark, mini, gpt-5.3-codex and
-// gpt-5.2 expose no service tier and the backend rejects one, so gate strictly.
+// increased usage) for the GPT-5.6 family and legacy gpt-5.5 / gpt-5.4.
+// Spark, mini, gpt-5.3-codex and gpt-5.2 reject the field, so gate strictly.
 export function supportsCodexServiceTier(model: string): boolean {
   const normalized = model.trim().toLowerCase()
   const base = normalized.split('?', 1)[0] ?? normalized
 
-  return base === 'gpt-5.5' || base === 'gpt-5.4'
+  return base === 'gpt-5.6-sol' ||
+    base === 'gpt-5.6-terra' ||
+    base === 'gpt-5.6-luna' ||
+    base === 'gpt-5.5' ||
+    base === 'gpt-5.4'
 }
 
 // gacbert patch: opt-in Codex Fast mode. OPENCLAUDE_CODEX_SERVICE_TIER, when set

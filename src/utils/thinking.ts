@@ -151,8 +151,38 @@ export function modelSupportsThinking(model: string): boolean {
       return false
     }
   }
-  // 3P (Bedrock/Vertex): only Opus 4+ and Sonnet 4+
-  return canonical.includes('sonnet-4') || canonical.includes('opus-4')
+  // 3P (Bedrock/Vertex): recent Opus and Sonnet families.
+  return (
+    canonical.includes('claude-sonnet-5') ||
+    canonical.includes('sonnet-4') ||
+    canonical.includes('opus-4') ||
+    canonical.includes('claude-opus-5')
+  )
+}
+
+/** Opus 5 and Sonnet 5 run adaptive thinking when `thinking` is omitted. */
+export function modelDefaultsToAdaptiveThinking(model: string): boolean {
+  const canonical = getCanonicalName(model)
+  return (
+    canonical.includes('claude-opus-5') ||
+    canonical.includes('claude-sonnet-5')
+  )
+}
+
+/** Opus 5 alone rejects xhigh/max effort when thinking is disabled. */
+export function modelCapsEffortWhenThinkingDisabled(model: string): boolean {
+  return getCanonicalName(model).includes('claude-opus-5')
+}
+
+/** Current adaptive-only models reject legacy budget-based thinking. */
+export function modelOnlySupportsAdaptiveThinking(model: string): boolean {
+  const canonical = getCanonicalName(model)
+  return (
+    canonical.includes('claude-opus-5') ||
+    canonical.includes('claude-sonnet-5') ||
+    canonical.includes('opus-4-8') ||
+    canonical.includes('opus-4-7')
+  )
 }
 
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports adaptive thinking.
@@ -162,8 +192,15 @@ export function modelSupportsAdaptiveThinking(model: string): boolean {
     return supported3P
   }
   const canonical = getCanonicalName(model)
-  // Supported by a subset of Claude 4 models
-  if (canonical.includes('opus-4-8') || canonical.includes('opus-4-7') || canonical.includes('opus-4-6') || canonical.includes('sonnet-4-6')) {
+  // Supported by current Opus and Sonnet models.
+  if (
+    canonical.includes('claude-opus-5') ||
+    canonical.includes('claude-sonnet-5') ||
+    canonical.includes('opus-4-8') ||
+    canonical.includes('opus-4-7') ||
+    canonical.includes('opus-4-6') ||
+    canonical.includes('sonnet-4-6')
+  ) {
     return true
   }
   // Exclude any other known legacy models (allowlist above catches 4-6 variants first)

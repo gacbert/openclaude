@@ -65,7 +65,10 @@ import {
   createToolUseSummaryMessage,
   createMicrocompactBoundaryMessage,
 } from './utils/messages.js'
-import { analyzeContinuationIntent } from './utils/continuation.js'
+import {
+  analyzeContinuationIntent,
+  CONTINUATION_NUDGE_MESSAGE,
+} from './utils/continuation.js'
 import { generateToolUseSummary } from './services/toolUseSummary/toolUseSummaryGenerator.js'
 import { prependUserContext, appendSystemContext } from './utils/api.js'
 import {
@@ -2317,14 +2320,19 @@ async function* queryLoop(
           logForDebugging(
             `Token budget continuation #${decision.continuationCount}: ${decision.pct}% (${decision.turnTokens.toLocaleString()} / ${decision.budget.toLocaleString()})`,
           )
+          const nudge = createUserMessage({
+            content: decision.nudgeMessage,
+            isMeta: true,
+          })
+          // Persist the synthetic turn boundary. Without this, a resumed
+          // transcript can contain assistant work with no user/meta parent,
+          // obscuring which logical turn authorized the continuation.
+          yield nudge
           state = {
             messages: [
               ...messagesForQuery,
               ...assistantMessages,
-              createUserMessage({
-                content: decision.nudgeMessage,
-                isMeta: true,
-              }),
+              nudge,
             ],
             toolUseContext,
             autoCompactTracking: tracking,
@@ -2390,10 +2398,13 @@ async function* queryLoop(
               `Continuation nudge triggered (${state.continuationNudgeCount + 1}/${MAX_CONTINUATION_NUDGES}): ${nudgeReason} detected in "${lastText.slice(-120)}" without tool calls`,
             )
             const nudge = createUserMessage({
-              content:
-                'Continue with the task. If you were interrupted, resume your thought. Otherwise, use the appropriate tools to proceed to the next step.',
+              content: CONTINUATION_NUDGE_MESSAGE,
               isMeta: true,
             })
+            // Match goal/Stop-hook continuation persistence: synthetic
+            // continuations are part of transcript lineage even though they
+            // are hidden from the interactive UI.
+            yield nudge
             const next: State = {
               messages: [...messagesForQuery, ...assistantMessages, nudge],
               toolUseContext,

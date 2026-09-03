@@ -76,9 +76,11 @@ import {
   type SystemPrompt,
 } from '../../utils/systemPromptType.js'
 import type { ContentReplacementState } from '../../utils/toolResultStorage.js'
+import { resolveChildEffort } from '../../utils/ultraMode.js'
 import { createAgentId } from '../../utils/uuid.js'
 import { resolveAgentTools } from './agentToolUtils.js'
 import { type AgentDefinition, isBuiltInAgent } from './loadAgentsDir.js'
+import { filterRootOnlyMcpToolsForAgent } from './rootOnlyMcpTools.js'
 
 /**
  * Initialize agent-specific MCP servers
@@ -512,10 +514,10 @@ export async function* runAgent({
     }
 
     // Override effort level if agent defines one
-    const effortValue =
-      agentDefinition.effort !== undefined
-        ? agentDefinition.effort
-        : state.effortValue
+    const effortValue = resolveChildEffort(
+      agentDefinition.effort,
+      state.effortValue,
+    )
 
     const modelStateChanged =
       state.mainLoopModel !== effectiveModel ||
@@ -537,9 +539,12 @@ export async function* runAgent({
     }
   }
 
-  const resolvedTools = useExactTools
-    ? availableTools
-    : resolveAgentTools(agentDefinition, availableTools, isAsync).resolvedTools
+  const resolvedTools = filterRootOnlyMcpToolsForAgent(
+    useExactTools
+      ? availableTools
+      : resolveAgentTools(agentDefinition, availableTools, isAsync)
+          .resolvedTools,
+  )
 
   const additionalWorkingDirectories = Array.from(
     appState.toolPermissionContext.additionalWorkingDirectories.keys(),
@@ -698,10 +703,11 @@ export async function* runAgent({
   // Merge agent MCP tools with resolved agent tools, deduplicating by name.
   // resolvedTools is already deduplicated (see resolveAgentTools), so skip
   // the spread + uniqBy overhead when there are no agent-specific MCP tools.
-  const allTools =
+  const allTools = filterRootOnlyMcpToolsForAgent(
     agentMcpTools.length > 0
       ? uniqBy([...resolvedTools, ...agentMcpTools], 'name')
-      : resolvedTools
+      : resolvedTools,
+  )
 
   // Build agent-specific options
   const agentOptions: ToolUseContext['options'] = {

@@ -160,9 +160,7 @@ describe('Agent loop continuation nudge', () => {
   test('nudge creates a meta user message to continue', async () => {
     const content = await file('query.ts').text()
 
-    expect(content).toContain(
-      'Continue with the task. If you were interrupted, resume your thought. Otherwise, use the appropriate tools to proceed to the next step.',
-    )
+    expect(content).toContain('CONTINUATION_NUDGE_MESSAGE')
   })
 })
 

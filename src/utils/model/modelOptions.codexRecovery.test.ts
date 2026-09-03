@@ -81,7 +81,7 @@ test('persisted [1m]-tagged Codex model surfaces its curated option under a non-
   // curated Codex label/description, not a generic "Custom model" entry.
   expect(recovered[0]!.label).toBe('gpt-5.6-terra')
   expect(recovered[0]!.description).toBe(
-    'GPT-5.6 Terra · Balanced everyday workhorse',
+    'GPT-5.6 Terra with medium reasoning · Default',
   )
   expect(options.some(opt => opt.description === 'Custom model')).toBe(false)
 })

@@ -3996,6 +3996,53 @@ class OpenAIShimStream {
   }
 }
 
+function getAnthropicMessagesReasoningFields(options: {
+  model: string
+  effort?: OpenAIShimEffortLevel
+  thinkingType?: string
+}): Record<string, unknown> {
+  const modelLower = options.model.toLowerCase()
+  const isClaude5 =
+    modelLower.includes('opus-5') || modelLower.includes('sonnet-5')
+  const isAdaptive =
+    isClaude5 ||
+    modelLower.includes('opus-4-7') ||
+    modelLower.includes('opus-4-6') ||
+    modelLower.includes('opus-4-8') ||
+    modelLower.includes('opus-4.6') ||
+    modelLower.includes('opus-4.7') ||
+    modelLower.includes('opus-4.8') ||
+    modelLower.includes('sonnet-4-6') ||
+    modelLower.includes('sonnet-4.6')
+  const isOpus45 =
+    modelLower.includes('opus-4-5') || modelLower.includes('opus-4.5')
+  const disabled = options.thinkingType === 'disabled'
+  const fields: Record<string, unknown> = disabled
+    ? { thinking: { type: 'disabled' } }
+    : {}
+
+  if (!options.effort) return fields
+
+  // Claude 5 exposes xhigh and max as distinct levels. Older shim routes used
+  // OpenAI's xhigh as a compatibility spelling for Anthropic max.
+  const effort =
+    !isClaude5 && options.effort === 'xhigh' ? 'max' : options.effort
+
+  if (isAdaptive) {
+    if (!disabled) fields.thinking = { type: 'adaptive' }
+    fields.effort = effort
+  } else if (isOpus45) {
+    fields.effort = effort
+  } else if (effort === 'high' || effort === 'max') {
+    fields.thinking = {
+      type: 'enabled',
+      budgetTokens: effort === 'max' ? 31_999 : 16_000,
+    }
+  }
+
+  return fields
+}
+
 class OpenAIShimMessages {
   private defaultHeaders: Record<string, string>
   private reasoningEffort?: OpenAIShimEffortLevel
@@ -4670,30 +4717,16 @@ class OpenAIShimMessages {
         anthropicBody.tool_choice = params.tool_choice
       }
 
-      if (request.reasoning?.effort) {
-        // Shim receives OpenAI effort levels (xhigh) from client.ts, but
-        // Anthropic API expects 'max' not 'xhigh'. Convert for the effort field.
-        const effort = request.reasoning.effort === 'xhigh' ? 'max' : request.reasoning.effort
-        const modelLower = request.resolvedModel.toLowerCase()
-        const isAdaptive = modelLower.includes('opus-4-7') || modelLower.includes('opus-4-6') ||
-          modelLower.includes('opus-4-8') ||
-          modelLower.includes('opus-4.6') || modelLower.includes('opus-4.7') ||
-          modelLower.includes('opus-4.8') ||
-          modelLower.includes('sonnet-4-6') || modelLower.includes('sonnet-4.6')
-        const isOpus45 = modelLower.includes('opus-4-5') || modelLower.includes('opus-4.5')
-
-        if (isAdaptive) {
-          anthropicBody.thinking = { type: 'adaptive' }
-          anthropicBody.effort = effort
-        } else if (isOpus45) {
-          anthropicBody.effort = effort
-        } else if (effort === 'high' || effort === 'max') {
-          anthropicBody.thinking = {
-            type: 'enabled',
-            budgetTokens: effort === 'max' ? 31_999 : 16_000,
-          }
-        }
-      }
+      Object.assign(
+        anthropicBody,
+        getAnthropicMessagesReasoningFields({
+          model: request.resolvedModel,
+          effort: request.reasoning?.effort,
+          thinkingType:
+            (params.thinking as { type?: string } | undefined)?.type ??
+            request.thinking?.type,
+        }),
+      )
 
       return anthropicBody
     }
@@ -5767,6 +5800,7 @@ export const __test = {
   getApiTimeoutMs,
   getChatMessagesForTransport,
   getCompressedMessagesForTransport,
+  getAnthropicMessagesReasoningFields,
   requestBodyContainsImages,
   getStreamIdleTimeoutMs,
   readWithIdleTimeout,

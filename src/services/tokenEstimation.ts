@@ -23,6 +23,7 @@ import {
   normalizeModelStringForAPI,
 } from '../utils/model/model.js'
 import { jsonStringify } from '../utils/slowOperations.js'
+import { modelOnlySupportsAdaptiveThinking } from '../utils/thinking.js'
 import { isToolReferenceBlock } from '../utils/toolSearch.js'
 import { getAPIMetadata, getExtraBodyParams } from './api/claude.js'
 import { getAnthropicClient } from './api/client.js'
@@ -34,6 +35,17 @@ const TOKEN_COUNT_THINKING_BUDGET = 1024
 const TOKEN_COUNT_MAX_TOKENS = 2048
 // Keep this local to avoid importing analyzeContext.ts, which already depends on tokenEstimation.
 const ROUGH_TOOL_TOKEN_COUNT_OVERHEAD = 500
+
+function getTokenCountingThinkingConfig(model: string):
+  | { type: 'adaptive' }
+  | { type: 'enabled'; budget_tokens: number } {
+  return modelOnlySupportsAdaptiveThinking(model)
+    ? { type: 'adaptive' }
+    : {
+        type: 'enabled',
+        budget_tokens: TOKEN_COUNT_THINKING_BUDGET,
+      }
+}
 
 type CountTokensMessagesClient = {
   countTokens?: Anthropic['beta']['messages']['countTokens']
@@ -214,7 +226,11 @@ async function countMessagesTokensWithClient({
   containsThinking: boolean
 }): Promise<number | null> {
   if (typeof messagesClient?.countTokens !== 'function') {
-    return roughTokenCountEstimationForCountTokensFallback(messages, tools)
+    return roughTokenCountEstimationForCountTokensFallback(
+      messages,
+      tools,
+      model,
+    )
   }
 
   const response = await messagesClient.countTokens({
@@ -227,10 +243,7 @@ async function countMessagesTokensWithClient({
     ...(filteredBetas.length > 0 && { betas: filteredBetas }),
     // Enable thinking if messages contain thinking blocks
     ...(containsThinking && {
-      thinking: {
-        type: 'enabled',
-        budget_tokens: TOKEN_COUNT_THINKING_BUDGET,
-      },
+      thinking: getTokenCountingThinkingConfig(model),
     }),
   })
 
@@ -246,7 +259,9 @@ async function countMessagesTokensWithClient({
 function roughTokenCountEstimationForCountTokensFallback(
   messages: Anthropic.Beta.Messages.BetaMessageParam[],
   tools: Anthropic.Beta.Messages.BetaToolUnion[],
+  model: string,
 ): number {
+  const bytesPerToken = getBytesPerTokenForModel(model)
   let totalTokens = 0
 
   for (const message of messages) {
@@ -256,20 +271,24 @@ function roughTokenCountEstimationForCountTokensFallback(
         | Array<Anthropic.ContentBlock>
         | Array<Anthropic.ContentBlockParam>
         | undefined,
+      bytesPerToken,
     )
   }
 
   if (tools.length > 0) {
     totalTokens +=
       ROUGH_TOOL_TOKEN_COUNT_OVERHEAD +
-      roughTokenCountEstimation(jsonStringify(tools))
+      roughTokenCountEstimation(jsonStringify(tools), bytesPerToken)
   }
 
   return totalTokens
 }
 
 // Test-only surface for fallback dispatch without process-wide module mocks.
-export const __test = { countMessagesTokensWithClient }
+export const __test = {
+  countMessagesTokensWithClient,
+  getTokenCountingThinkingConfig,
+}
 
 export function roughTokenCountEstimation(
   content: string,
@@ -306,6 +325,7 @@ export interface ModelTokenizerConfig {
 }
 
 export const MODEL_TOKENIZER_CONFIGS: ModelTokenizerConfig[] = [
+  { modelFamily: 'claude-sonnet-5', bytesPerToken: 2.7, supportsJson: true, supportsCode: true },
   { modelFamily: 'claude', bytesPerToken: 3.5, supportsJson: true, supportsCode: true },
   { modelFamily: 'gpt-4', bytesPerToken: 4, supportsJson: true, supportsCode: true },
   { modelFamily: 'gpt-3.5', bytesPerToken: 4, supportsJson: true, supportsCode: true },
@@ -523,10 +543,7 @@ export async function countTokensViaHaikuFallback(
     ...getExtraBodyParams(),
     // Enable thinking if messages contain thinking blocks
     ...(containsThinking && {
-      thinking: {
-        type: 'enabled',
-        budget_tokens: TOKEN_COUNT_THINKING_BUDGET,
-      },
+      thinking: getTokenCountingThinkingConfig(model),
     }),
   })
 
@@ -544,19 +561,23 @@ export function roughTokenCountEstimationForMessages(
     message?: { content?: unknown }
     attachment?: Attachment
   }[],
+  bytesPerToken = 4,
 ): number {
   let totalTokens = 0
   for (const message of messages) {
-    totalTokens += roughTokenCountEstimationForMessage(message)
+    totalTokens += roughTokenCountEstimationForMessage(message, bytesPerToken)
   }
   return totalTokens
 }
 
-export function roughTokenCountEstimationForMessage(message: {
-  type: string
-  message?: { content?: unknown }
-  attachment?: Attachment
-}): number {
+export function roughTokenCountEstimationForMessage(
+  message: {
+    type: string
+    message?: { content?: unknown }
+    attachment?: Attachment
+  },
+  bytesPerToken = 4,
+): number {
   if (
     (message.type === 'assistant' || message.type === 'user') &&
     message.message?.content
@@ -567,6 +588,7 @@ export function roughTokenCountEstimationForMessage(message: {
         | Array<Anthropic.ContentBlock>
         | Array<Anthropic.ContentBlockParam>
         | undefined,
+      bytesPerToken,
     )
   }
 
@@ -574,7 +596,10 @@ export function roughTokenCountEstimationForMessage(message: {
     const userMessages = normalizeAttachmentForAPI(message.attachment)
     let total = 0
     for (const userMsg of userMessages) {
-      total += roughTokenCountEstimationForContent(userMsg.message.content)
+      total += roughTokenCountEstimationForContent(
+        userMsg.message.content,
+        bytesPerToken,
+      )
     }
     return total
   }
@@ -590,16 +615,17 @@ function roughTokenCountEstimationForContent(
     // not part of the top-level ContentBlockParam union.
     | Array<Anthropic.ContentBlockParam | Anthropic.ToolReferenceBlockParam>
     | undefined,
+  bytesPerToken = 4,
 ): number {
   if (!content) {
     return 0
   }
   if (typeof content === 'string') {
-    return roughTokenCountEstimation(content)
+    return roughTokenCountEstimation(content, bytesPerToken)
   }
   let totalTokens = 0
   for (const block of content) {
-    totalTokens += roughTokenCountEstimationForBlock(block)
+    totalTokens += roughTokenCountEstimationForBlock(block, bytesPerToken)
   }
   return totalTokens
 }
@@ -611,12 +637,13 @@ function roughTokenCountEstimationForBlock(
     | Anthropic.ContentBlockParam
     // Nested tool_result content block; falls through to the stringify path.
     | Anthropic.ToolReferenceBlockParam,
+  bytesPerToken = 4,
 ): number {
   if (typeof block === 'string') {
-    return roughTokenCountEstimation(block)
+    return roughTokenCountEstimation(block, bytesPerToken)
   }
   if (block.type === 'text') {
-    return roughTokenCountEstimation(block.text)
+    return roughTokenCountEstimation(block.text, bytesPerToken)
   }
   if (block.type === 'image' || block.type === 'document') {
     // https://platform.claude.com/docs/en/build-with-claude/vision#calculate-image-costs
@@ -632,7 +659,7 @@ function roughTokenCountEstimationForBlock(
     return 2000
   }
   if (block.type === 'tool_result') {
-    return roughTokenCountEstimationForContent(block.content)
+    return roughTokenCountEstimationForContent(block.content, bytesPerToken)
   }
   if (block.type === 'tool_use') {
     // input is the JSON the model generated — arbitrarily large (bash
@@ -640,19 +667,20 @@ function roughTokenCountEstimationForBlock(
     // char count; the API re-serializes anyway so this is what it sees.
     return roughTokenCountEstimation(
       block.name + jsonStringify(block.input ?? {}),
+      bytesPerToken,
     )
   }
   if (block.type === 'thinking') {
-    return roughTokenCountEstimation(block.thinking)
+    return roughTokenCountEstimation(block.thinking, bytesPerToken)
   }
   if (block.type === 'redacted_thinking') {
-    return roughTokenCountEstimation(block.data)
+    return roughTokenCountEstimation(block.data, bytesPerToken)
   }
   // server_tool_use, web_search_tool_result, mcp_tool_use, etc. —
   // text-like payloads (tool inputs, search results, no base64).
   // Stringify-length tracks the serialized form the API sees; the
   // key/bracket overhead is single-digit percent on real blocks.
-  return roughTokenCountEstimation(jsonStringify(block))
+  return roughTokenCountEstimation(jsonStringify(block), bytesPerToken)
 }
 
 async function countTokensWithBedrock({
@@ -688,10 +716,7 @@ async function countTokensWithBedrock({
       ...(tools.length > 0 && { tools }),
       ...(betas.length > 0 && { anthropic_beta: betas }),
       ...(containsThinking && {
-        thinking: {
-          type: 'enabled',
-          budget_tokens: TOKEN_COUNT_THINKING_BUDGET,
-        },
+        thinking: getTokenCountingThinkingConfig(model),
       }),
     }
 

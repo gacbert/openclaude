@@ -45,6 +45,7 @@ export {
   sanitizeProviderConfigValue,
 } from './providerSecrets.js'
 import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
+import { isFirstPartyAnthropicBaseUrlForEnv } from './anthropicBaseUrl.js'
 
 export const PROFILE_FILE_NAME = '.openclaude-profile.json'
 export const DEFAULT_GEMINI_BASE_URL =
@@ -399,7 +400,7 @@ export function buildBedrockProfileEnv(options: {
     ANTHROPIC_MODEL:
       normalizeProfileModel(
         sanitizeProviderConfigValue(options.model),
-      ) || 'claude-sonnet-4-6',
+      ) || 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
   }
 
   const baseUrl = sanitizeProviderConfigValue(options.baseUrl)
@@ -418,7 +419,7 @@ export function buildVertexProfileEnv(options: {
     ANTHROPIC_MODEL:
       normalizeProfileModel(
         sanitizeProviderConfigValue(options.model),
-      ) || 'claude-sonnet-4-6',
+      ) || 'claude-sonnet-4-5@20250929',
   }
 
   const baseUrl = sanitizeProviderConfigValue(options.baseUrl)
@@ -1560,6 +1561,12 @@ export async function buildLaunchEnv(options: {
       ? undefined
       : sanitizeApiKey(processEnv.ANTHROPIC_API_KEY) ||
         sanitizeApiKey(persistedEnv.ANTHROPIC_API_KEY)
+    const defaultAnthropicModel = isFirstPartyAnthropicBaseUrlForEnv({
+      ...processEnv,
+      ANTHROPIC_BASE_URL: anthropicBaseUrl,
+    })
+      ? 'claude-sonnet-5'
+      : 'claude-sonnet-4-6'
 
     return buildCompatibilityProcessEnv({
       processEnv,
@@ -1575,7 +1582,7 @@ export async function buildLaunchEnv(options: {
           normalizeProfileModel(
             sanitizeProviderConfigValue(persistedEnv.ANTHROPIC_MODEL),
           ) ||
-          'claude-sonnet-4-6',
+          defaultAnthropicModel,
         ...(anthropicApiKey
           ? { ANTHROPIC_API_KEY: anthropicApiKey }
           : {}),
@@ -1607,8 +1614,7 @@ export async function buildLaunchEnv(options: {
           ) ||
           normalizeProfileModel(
             sanitizeProviderConfigValue(persistedEnv.ANTHROPIC_MODEL),
-          ) ||
-          'claude-sonnet-4-6',
+          ),
         baseUrl: bedrockBaseUrl,
       }),
     })
@@ -1629,8 +1635,7 @@ export async function buildLaunchEnv(options: {
           ) ||
           normalizeProfileModel(
             sanitizeProviderConfigValue(persistedEnv.ANTHROPIC_MODEL),
-          ) ||
-          'claude-sonnet-4-6',
+          ),
         baseUrl: vertexBaseUrl,
       }),
     })

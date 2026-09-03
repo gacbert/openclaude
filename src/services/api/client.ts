@@ -20,7 +20,7 @@ import {
   type OpenAIShimEffortLevel,
 } from 'src/utils/effort.js'
 import { getUserAgent } from 'src/utils/http.js'
-import { getSmallFastModel } from 'src/utils/model/model.js'
+import { getCanonicalName, getSmallFastModel } from 'src/utils/model/model.js'
 import {
   getAPIProvider,
   isFirstPartyAnthropicBaseUrl,
@@ -69,6 +69,21 @@ export function _setOptionalRuntimeModuleImporterForTesting(
   importOptionalRuntimeModuleForClient = importer ?? importOptionalRuntimeModule
 }
 
+export function mapAppliedEffortToShim(
+  model: string,
+  level: EffortValue,
+): OpenAIShimEffortLevel {
+  if (
+    typeof level === 'string' &&
+    /claude-(?:opus|sonnet)-5/.test(getCanonicalName(model))
+  ) {
+    if (level === 'ultra') return 'max'
+    if (level === 'ultracode') return 'xhigh'
+    return level as OpenAIShimEffortLevel
+  }
+  return standardEffortToOpenAI(convertEffortValueToLevel(level))
+}
+
 /**
  * Environment variables for different client types:
  *
@@ -98,6 +113,8 @@ export function _setOptionalRuntimeModuleImporterForTesting(
  *   - VERTEX_REGION_CLAUDE_HAIKU_4_5: Region for Claude Haiku 4.5 model
  *   - VERTEX_REGION_CLAUDE_3_5_SONNET: Region for Claude 3.5 Sonnet model
  *   - VERTEX_REGION_CLAUDE_3_7_SONNET: Region for Claude 3.7 Sonnet model
+ *   - VERTEX_REGION_CLAUDE_5_SONNET: Region for Claude Sonnet 5
+ *   - VERTEX_REGION_CLAUDE_5_OPUS: Region for Claude Opus 5
  * - CLOUD_ML_REGION: Optional. The default GCP region to use for all models
  *   If specific model region not specified above
  * - ANTHROPIC_VERTEX_PROJECT_ID: Required. Your GCP project ID
@@ -456,13 +473,15 @@ export async function getAnthropicClient({
     ? undefined
     : convertEffortValueToLevel(appliedEffort)
   const shimReasoningEffort: OpenAIShimEffortLevel | undefined =
-    appliedEffortLevel !== undefined && supportsShimReasoningEffort
+    effortModel !== undefined &&
+    appliedEffortLevel !== undefined &&
+    supportsShimReasoningEffort
       ? (reasoningControl?.source === 'metadata' &&
           reasoningControl.wireFormat === 'reasoning_effort' &&
           appliedEffortLevel === 'max' &&
           k3ReasoningControl
             ? 'max'
-          : standardEffortToOpenAI(appliedEffortLevel))
+          : mapAppliedEffortToShim(effortModel, appliedEffortLevel))
       : undefined
   const containerId = process.env.CLAUDE_CODE_CONTAINER_ID
   const remoteSessionId = process.env.CLAUDE_CODE_REMOTE_SESSION_ID

@@ -5,6 +5,8 @@ import {
 } from '../test/sharedMutationLock.js'
 import {
   CLAUDE_CODE_20250219_BETA_HEADER,
+  CONTEXT_1M_BETA_HEADER,
+  WEB_SEARCH_BETA_HEADER,
 } from '../constants/betas.js'
 import { setSdkBetas } from '../bootstrap/state.js'
 
@@ -146,6 +148,34 @@ test('getMergedBetas returns a non-empty list for the firstParty provider', asyn
   expect(getMergedBetas(MODEL).length).toBeGreaterThan(0)
 })
 
+test('Opus 5 enables its confirmed first-party beta-gated capabilities', async () => {
+  const {
+    modelSupportsContextManagement,
+    modelSupportsISP,
+    modelSupportsStructuredOutputs,
+  } = await importFreshBetas()
+  expect(modelSupportsISP('claude-opus-5')).toBe(true)
+  expect(modelSupportsContextManagement('claude-opus-5')).toBe(true)
+  expect(modelSupportsStructuredOutputs('claude-opus-5')).toBe(true)
+})
+
+test('Sonnet 5 enables confirmed first-party capabilities without the legacy 1M beta', async () => {
+  const {
+    getAllModelBetas,
+    modelSupportsContextManagement,
+    modelSupportsISP,
+    modelSupportsStructuredOutputs,
+  } = await importFreshBetas()
+  const model = 'claude-sonnet-5'
+
+  expect(modelSupportsISP(model)).toBe(true)
+  expect(modelSupportsContextManagement(model)).toBe(true)
+  expect(modelSupportsStructuredOutputs(model)).toBe(true)
+  expect(getAllModelBetas(`${model}[1m]`)).not.toContain(
+    CONTEXT_1M_BETA_HEADER,
+  )
+})
+
 test('modelSupportsStructuredOutputs covers the recent Opus models (4.8/4.7/4.6) on firstParty (#1769)', async () => {
   // No provider env set => firstParty. Pre-fix, 4.7/4.8 were absent from the
   // allowlist, so first-party requests on the new default Opus 4.8 lost the
@@ -164,16 +194,69 @@ test('getMergedBetas returns a non-empty list for the bedrock provider', async (
   expect(getMergedBetas(MODEL).length).toBeGreaterThan(0)
 })
 
+test('native first-party Opus 5 does not send the legacy 1M beta', async () => {
+  const { getAllModelBetas } = await importFreshBetas()
+  expect(getAllModelBetas('claude-opus-5[1m]')).not.toContain(
+    CONTEXT_1M_BETA_HEADER,
+  )
+})
+
+test('Bedrock Opus 5 retains the legacy 1M compatibility beta in extra body params', async () => {
+  process.env.CLAUDE_CODE_USE_BEDROCK = '1'
+  const {
+    getBedrockExtraBodyParamsBetas,
+    modelSupportsContextManagement,
+    modelSupportsISP,
+    modelSupportsStructuredOutputs,
+  } = await importFreshBetas()
+  const model = 'us.anthropic.claude-opus-5[1m]'
+  expect(getBedrockExtraBodyParamsBetas(model)).toContain(
+    CONTEXT_1M_BETA_HEADER,
+  )
+  expect(modelSupportsISP(model)).toBe(true)
+  expect(modelSupportsContextManagement(model)).toBe(true)
+  expect(modelSupportsStructuredOutputs(model)).toBe(false)
+})
+
 test('getMergedBetas returns a non-empty list for the vertex provider', async () => {
   process.env.CLAUDE_CODE_USE_VERTEX = '1'
   const { getMergedBetas } = await importFreshBetas()
   expect(getMergedBetas(MODEL).length).toBeGreaterThan(0)
 })
 
+test('Vertex Opus 5 retains the legacy 1M beta and enables web search', async () => {
+  process.env.CLAUDE_CODE_USE_VERTEX = '1'
+  const {
+    getModelBetas,
+    modelSupportsContextManagement,
+    modelSupportsISP,
+    modelSupportsStructuredOutputs,
+  } = await importFreshBetas()
+  const model = 'claude-opus-5[1m]'
+  const betas = getModelBetas(model)
+  expect(betas).toContain(CONTEXT_1M_BETA_HEADER)
+  expect(betas).toContain(WEB_SEARCH_BETA_HEADER)
+  expect(modelSupportsISP(model)).toBe(true)
+  expect(modelSupportsContextManagement(model)).toBe(true)
+  expect(modelSupportsStructuredOutputs(model)).toBe(false)
+})
+
 test('getMergedBetas returns a non-empty list for the foundry provider', async () => {
   process.env.CLAUDE_CODE_USE_FOUNDRY = '1'
   const { getMergedBetas } = await importFreshBetas()
   expect(getMergedBetas(MODEL).length).toBeGreaterThan(0)
+})
+
+test('Foundry does not inherit first-party structured outputs for Opus 5', async () => {
+  process.env.CLAUDE_CODE_USE_FOUNDRY = '1'
+  const { modelSupportsStructuredOutputs } = await importFreshBetas()
+  expect(modelSupportsStructuredOutputs('claude-opus-5')).toBe(false)
+})
+
+test('Foundry supports structured outputs for Sonnet 5', async () => {
+  process.env.CLAUDE_CODE_USE_FOUNDRY = '1'
+  const { modelSupportsStructuredOutputs } = await importFreshBetas()
+  expect(modelSupportsStructuredOutputs('claude-sonnet-5')).toBe(true)
 })
 
 test('getMergedBetas returns a non-empty list in GitHub Native Anthropic mode', async () => {

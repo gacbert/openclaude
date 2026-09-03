@@ -1,8 +1,7 @@
 import type { PermissionMode } from '../../../utils/permissions/PermissionMode.js'
 import type { SettingsJson } from '../../../utils/settings/types.js'
 import { isModelAllowed } from '../../../utils/model/modelAllowlist.js'
-import { getCanonicalName } from '../../../utils/model/model.js'
-import { MODEL_COSTS } from '../../../utils/modelCost.js'
+import { getKnownModelCosts } from '../../../utils/modelCost.js'
 import { routeModel, type RoutingInput } from '../smartModelRouting.js'
 import { readSmartRouting, type NormalizedSmartRouting } from './settings.js'
 import { resolveSmartRoutingConfig } from './resolveConfig.js'
@@ -14,7 +13,7 @@ import { resolveSmartRoutingConfig } from './resolveConfig.js'
  * estimated-savings line (U6).
  */
 export function getKnownInputCost(model: string): number | undefined {
-  return MODEL_COSTS[getCanonicalName(model)]?.inputTokens
+  return getKnownModelCosts(model)?.inputTokens
 }
 
 export { readSmartRouting, type NormalizedSmartRouting }

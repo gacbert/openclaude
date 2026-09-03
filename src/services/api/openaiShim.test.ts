@@ -14,7 +14,11 @@ import {
   extractOpenAICategoryMarker,
   isOpenAIRequestNonReplayable,
 } from './openaiErrorClassification.ts'
-import { createOpenAIShimClient, hasMistralApiHost } from './openaiShim.ts'
+import {
+  __test as openAIShimTest,
+  createOpenAIShimClient,
+  hasMistralApiHost,
+} from './openaiShim.ts'
 import * as realCodexShim from './codexShim.js'
 import * as realGithubModelsCredentials from '../../utils/githubModelsCredentials.js'
 
@@ -4407,6 +4411,42 @@ test('xiaomi mimo token plan uses raw api-key and OpenAI-compatible reasoning_ef
   expect(capturedBody).not.toHaveProperty('max_tokens')
   expect(capturedBody).not.toHaveProperty('store')
   expect(capturedBody).not.toHaveProperty('stream_options')
+})
+
+test('Anthropic-shaped Sonnet 5 requests preserve effort levels and disabled thinking', () => {
+  expect(
+    openAIShimTest.getAnthropicMessagesReasoningFields({
+      model: 'claude-sonnet-5',
+      effort: 'xhigh',
+    }),
+  ).toEqual({ thinking: { type: 'adaptive' }, effort: 'xhigh' })
+  expect(
+    openAIShimTest.getAnthropicMessagesReasoningFields({
+      model: 'claude-sonnet-5',
+      effort: 'max',
+    }),
+  ).toEqual({ thinking: { type: 'adaptive' }, effort: 'max' })
+  expect(
+    openAIShimTest.getAnthropicMessagesReasoningFields({
+      model: 'claude-sonnet-5',
+      effort: 'xhigh',
+      thinkingType: 'disabled',
+    }),
+  ).toEqual({ thinking: { type: 'disabled' }, effort: 'xhigh' })
+  expect(
+    openAIShimTest.getAnthropicMessagesReasoningFields({
+      model: 'claude-sonnet-5',
+      thinkingType: 'disabled',
+    }),
+  ).toEqual({ thinking: { type: 'disabled' } })
+
+  // Preserve the older shim compatibility mapping outside Claude 5.
+  expect(
+    openAIShimTest.getAnthropicMessagesReasoningFields({
+      model: 'claude-opus-4-8',
+      effort: 'xhigh',
+    }),
+  ).toEqual({ thinking: { type: 'adaptive' }, effort: 'max' })
 })
 
 test.each([

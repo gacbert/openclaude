@@ -73,20 +73,24 @@ describe('approximateMessageTokens', () => {
 
       const { approximateMessageTokensForTesting } =
         await loadAnalyzeContextForTesting()
-      const breakdown = await approximateMessageTokensForTesting([
-        {
-          type: 'user',
-          message: {
-            role: 'user',
-            content: 'hello from an environment with no token counter',
+      const content = 'a'.repeat(270)
+      const breakdown = await approximateMessageTokensForTesting(
+        [
+          {
+            type: 'user',
+            message: {
+              role: 'user',
+              content,
+            },
           },
-        },
-      ])
+        ],
+        'claude-sonnet-5',
+      )
 
       expect(countMessagesTokensWithAPI).toHaveBeenCalled()
       expect(countTokensViaHaikuFallback).toHaveBeenCalled()
-      expect(breakdown.totalTokens).toBeGreaterThan(0)
-      expect(breakdown.userMessageTokens).toBeGreaterThan(0)
+      expect(breakdown.totalTokens).toBe(100)
+      expect(breakdown.userMessageTokens).toBe(100)
     } finally {
       mock.restore()
       if (originalFixtureRoot === undefined) {

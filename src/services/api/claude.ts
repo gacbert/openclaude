@@ -94,6 +94,7 @@ import {
   getDefaultOpusModel,
   getDefaultSonnetModel,
   getSmallFastModel,
+  getCanonicalName,
   isNonCustomOpusModel,
 } from '../../utils/model/model.js'
 import {
@@ -101,6 +102,7 @@ import {
   type SystemPrompt,
 } from '../../utils/systemPromptType.js'
 import { tokenCountFromLastAPIResponse } from '../../utils/tokens.js'
+import { getUltraSystemPrompt } from '../../utils/ultraMode.js'
 import { getDynamicConfig_BLOCKS_ON_INIT } from '../analytics/growthbook.js'
 import {
   currentLimits,
@@ -189,6 +191,9 @@ import { isMcpInstructionsDeltaEnabled } from 'src/utils/mcpInstructionsDelta.js
 import { calculateUSDCost } from 'src/utils/modelCost.js'
 import { endQueryProfile, queryCheckpoint } from 'src/utils/queryProfiler.js'
 import {
+  modelCapsEffortWhenThinkingDisabled,
+  modelDefaultsToAdaptiveThinking,
+  modelOnlySupportsAdaptiveThinking,
   modelSupportsAdaptiveThinking,
   shouldUseThinkingForModel,
   type ThinkingConfig,
@@ -473,6 +478,7 @@ function configureEffortParams(
   extraBodyParams: Record<string, unknown>,
   betas: string[],
   model: string,
+  thinkingDisabled: boolean,
 ): void {
   if (!modelSupportsEffort(model) || 'effort' in outputConfig) {
     return
@@ -481,8 +487,20 @@ function configureEffortParams(
   if (effortValue === undefined) {
     betas.push(EFFORT_BETA_HEADER)
   } else if (typeof effortValue === 'string') {
-    // Send string effort level as is
-    outputConfig.effort = effortValue
+    // Opus 5 rejects xhigh/max effort when thinking is disabled. Earlier Opus
+    // models support effort independently of thinking, so keep the cap scoped
+    // to the model whose native adaptive-thinking contract requires it. Ultra
+    // is OpenClaude-internal.
+    outputConfig.effort =
+      thinkingDisabled &&
+      modelCapsEffortWhenThinkingDisabled(model) &&
+      (effortValue === 'xhigh' ||
+        effortValue === 'max' ||
+        effortValue === 'ultra')
+        ? 'high'
+        : effortValue === 'ultra'
+          ? 'max'
+          : effortValue
     betas.push(EFFORT_BETA_HEADER)
   } else if (process.env.USER_TYPE === 'ant') {
     // Numeric effort override - internal-only (uses anthropic_internal)
@@ -510,10 +528,12 @@ export function configureTaskBudgetParams(
   taskBudget: Options['taskBudget'],
   outputConfig: BetaOutputConfig & { task_budget?: TaskBudgetParam },
   betas: string[],
+  model: string,
 ): void {
   if (
     !taskBudget ||
     'task_budget' in outputConfig ||
+    getCanonicalName(model).includes('claude-sonnet-5') ||
     !shouldIncludeFirstPartyOnlyBetas()
   ) {
     return
@@ -1532,6 +1552,12 @@ async function* queryModel(
   const injectChromeHere =
     useToolSearch && hasChromeTools && !isMcpInstructionsDeltaEnabled()
 
+  const effort = resolveAppliedEffort(options.model, options.effortValue)
+  const ultraSystemPrompt = getUltraSystemPrompt(
+    effort,
+    options.agentId !== undefined,
+  )
+
   // filter(Boolean) works by converting each element to a boolean - empty strings become false and are filtered out.
   systemPrompt = asSystemPrompt(
     [
@@ -1541,6 +1567,7 @@ async function* queryModel(
         hasAppendSystemPrompt: options.hasAppendSystemPrompt,
       }),
       ...systemPrompt,
+      ...(ultraSystemPrompt ? [ultraSystemPrompt] : []),
       ...(advisorModel ? [ADVISOR_TOOL_INSTRUCTIONS] : []),
       ...(injectChromeHere ? [CHROME_TOOL_SEARCH_INSTRUCTIONS] : []),
     ].filter(Boolean),
@@ -1635,8 +1662,6 @@ async function* queryModel(
   // don't flip the beta header and bust the cache key.
   const sonnet1mExpLatched = getSonnet1mExpTreatmentEnabled(options.model)
 
-  const effort = resolveAppliedEffort(options.model, options.effortValue)
-
   if (feature('PROMPT_CACHE_BREAK_DETECTION')) {
     // Exclude defer_loading tools from the hash -- the API strips them from the
     // prompt, so they never affect the actual cache key. Including them creates
@@ -1714,6 +1739,7 @@ async function* queryModel(
   let lastRequestBetas: string[] | undefined
 
   const paramsFromContext = (retryContext: RetryContext) => {
+    const retryModel = retryContext.model
     const betasParams = [...betas]
 
     // Append 1M beta from the latched experiment state (computed once before
@@ -1735,19 +1761,24 @@ async function* queryModel(
     const outputConfig: BetaOutputConfig = {
       ...((extraBodyParams.output_config as BetaOutputConfig) ?? {}),
     }
+    const thinkingDisabled =
+      thinkingConfig.type === 'disabled' ||
+      isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_THINKING)
 
     configureEffortParams(
       effort,
       outputConfig,
       extraBodyParams,
       betasParams,
-      options.model,
+      retryModel,
+      thinkingDisabled,
     )
 
     configureTaskBudgetParams(
       options.taskBudget,
       outputConfig as BetaOutputConfig & { task_budget?: TaskBudgetParam },
       betasParams,
+      retryModel,
     )
 
     // Merge outputFormat into extraBodyParams.output_config alongside effort
@@ -1756,7 +1787,7 @@ async function* queryModel(
       outputConfig.format = options.outputFormat as BetaJSONOutputFormat
       // Add beta header if not already present and provider supports it
       if (
-        modelSupportsStructuredOutputs(options.model) &&
+        modelSupportsStructuredOutputs(retryModel) &&
         !betasParams.includes(STRUCTURED_OUTPUTS_BETA_HEADER)
       ) {
         betasParams.push(STRUCTURED_OUTPUTS_BETA_HEADER)
@@ -1767,18 +1798,23 @@ async function* queryModel(
     const maxOutputTokens =
       retryContext?.maxTokensOverride ||
       options.maxOutputTokensOverride ||
-      getMaxOutputTokensForModel(options.model)
+      getMaxOutputTokensForModel(retryModel)
 
-    const hasThinking = shouldUseThinkingForModel(retryContext.model, thinkingConfig)
+    const hasThinking = shouldUseThinkingForModel(retryModel, thinkingConfig)
     let thinking: BetaMessageStreamParams['thinking'] | undefined = undefined
 
     // IMPORTANT: Do not change the adaptive-vs-budget thinking selection below
     // without notifying the model launch DRI and research. This is a sensitive
     // setting that can greatly affect model quality and bashing.
     if (hasThinking) {
-      if (
-        !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING) &&
-        modelSupportsAdaptiveThinking(retryContext.model)
+      if (modelDefaultsToAdaptiveThinking(retryModel)) {
+        // Opus 5 and Sonnet 5 default to adaptive thinking when omitted.
+        // Rely on that default so the request stays on the native launch path.
+      } else if (
+        modelOnlySupportsAdaptiveThinking(retryModel) ||
+        (!isEnvTruthy(
+          process.env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING,
+        ) && modelSupportsAdaptiveThinking(retryModel))
       ) {
         // For models that support adaptive thinking, always use adaptive
         // thinking without a budget.
@@ -1788,7 +1824,7 @@ async function* queryModel(
       } else {
         // For models that do not support adaptive thinking, use the default
         // thinking budget unless explicitly specified.
-        let thinkingBudget = getMaxThinkingTokensForModel(retryContext.model)
+        let thinkingBudget = getMaxThinkingTokensForModel(retryModel)
         if (
           thinkingConfig.type === 'enabled' &&
           thinkingConfig.budgetTokens !== undefined
@@ -1801,6 +1837,15 @@ async function* queryModel(
           type: 'enabled',
         } satisfies BetaMessageStreamParams['thinking']
       }
+    } else if (
+      thinkingDisabled &&
+      modelDefaultsToAdaptiveThinking(retryModel)
+    ) {
+      // Omitting the field enables adaptive thinking on Opus 5/Sonnet 5, so
+      // an effective disable must be explicit on the wire.
+      thinking = {
+        type: 'disabled',
+      } satisfies BetaMessageStreamParams['thinking']
     }
 
     // Get API context management strategies if enabled
@@ -1821,7 +1866,7 @@ async function* queryModel(
       isFastModeEnabled() &&
       isFastModeAvailable() &&
       !isFastModeCooldown() &&
-      isFastModeSupportedByModel(options.model) &&
+      isFastModeSupportedByModel(retryModel) &&
       !!retryContext.fastMode
     if (isFastModeForRetry) {
       speed = 'fast'
@@ -1866,14 +1911,15 @@ async function* queryModel(
 
     // Only send temperature when thinking is disabled — the API requires
     // temperature: 1 when thinking is enabled, which is already the default.
-    const temperature = !hasThinking
+    const temperature =
+      !hasThinking && !modelOnlySupportsAdaptiveThinking(retryModel)
       ? (options.temperatureOverride ?? 1)
       : undefined
 
     lastRequestBetas = betasParams
 
     return {
-      model: normalizeModelStringForAPI(options.model),
+      model: normalizeModelStringForAPI(retryModel),
       // IMPORTANT: `system` must appear before `messages` in the object literal.
       // JSON.stringify preserves insertion order. The native Bun attestation
       // (Attestation.zig) overwrites the FIRST `cch=00000` sentinel in the
@@ -1924,7 +1970,12 @@ async function* queryModel(
     })
     const logMessagesLength = queryParams.messages.length
     const logBetas = useBetas ? (queryParams.betas ?? []) : []
-    const logThinkingType = queryParams.thinking?.type ?? 'disabled'
+    const logThinkingType =
+      queryParams.thinking?.type ??
+      (modelDefaultsToAdaptiveThinking(options.model) &&
+      shouldUseThinkingForModel(options.model, thinkingConfig)
+        ? 'adaptive'
+        : 'disabled')
     const logEffortValue = queryParams.output_config?.effort
     void options.getToolPermissionContext().then(permissionContext => {
       logAPIQuery({

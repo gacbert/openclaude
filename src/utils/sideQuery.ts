@@ -17,6 +17,7 @@ import { getAnthropicClient } from '../services/api/client.js'
 import { getModelBetas, modelSupportsStructuredOutputs } from './betas.js'
 import { computeFingerprint } from './fingerprint.js'
 import { normalizeModelStringForAPI } from './model/model.js'
+import { modelOnlySupportsAdaptiveThinking } from './thinking.js'
 
 type MessageParam = Anthropic.MessageParam
 type TextBlockParam = Anthropic.TextBlockParam
@@ -62,6 +63,37 @@ export type SideQueryOptions = {
   /** Attributes this call in tengu_api_success for COGS joining against reporting.sampling_calls. */
   querySource: QuerySource
 }
+
+function getSideQueryReasoningParams(
+  model: string,
+  thinking: number | false | undefined,
+  maxTokens: number,
+  temperature: number | undefined,
+): {
+  thinking?: BetaThinkingConfigParam
+  temperature?: number
+} {
+  const adaptiveOnly = modelOnlySupportsAdaptiveThinking(model)
+  let thinkingConfig: BetaThinkingConfigParam | undefined
+
+  if (thinking === false) {
+    thinkingConfig = { type: 'disabled' }
+  } else if (thinking !== undefined) {
+    thinkingConfig = adaptiveOnly
+      ? { type: 'adaptive' }
+      : {
+          type: 'enabled',
+          budget_tokens: Math.min(thinking, maxTokens - 1),
+        }
+  }
+
+  return {
+    ...(temperature !== undefined && !adaptiveOnly && { temperature }),
+    ...(thinkingConfig && { thinking: thinkingConfig }),
+  }
+}
+
+export const __test = { getSideQueryReasoningParams }
 
 /**
  * Extract text from first user message for fingerprint computation.
@@ -166,15 +198,12 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
         : []),
   ].filter((block): block is TextBlockParam => block !== null)
 
-  let thinkingConfig: BetaThinkingConfigParam | undefined
-  if (thinking === false) {
-    thinkingConfig = { type: 'disabled' }
-  } else if (thinking !== undefined) {
-    thinkingConfig = {
-      type: 'enabled',
-      budget_tokens: Math.min(thinking, max_tokens - 1),
-    }
-  }
+  const reasoningParams = getSideQueryReasoningParams(
+    model,
+    thinking,
+    max_tokens,
+    temperature,
+  )
 
   const normalizedModel = normalizeModelStringForAPI(model)
   const start = Date.now()
@@ -188,9 +217,8 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
       ...(tools && { tools }),
       ...(tool_choice && { tool_choice }),
       ...(output_format && { output_config: { format: output_format } }),
-      ...(temperature !== undefined && { temperature }),
+      ...reasoningParams,
       ...(stop_sequences && { stop_sequences }),
-      ...(thinkingConfig && { thinking: thinkingConfig }),
       ...(betas.length > 0 && { betas }),
       metadata: getAPIMetadata(),
     },

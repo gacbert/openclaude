@@ -34,6 +34,7 @@ export const EFFORT_LEVELS = [
   'xhigh',
   'max',
   'ultracode',
+  'ultra',
 ] as const satisfies readonly EffortLevel[]
 
 export const OPENAI_EFFORT_LEVELS = [
@@ -41,7 +42,15 @@ export const OPENAI_EFFORT_LEVELS = [
   'medium',
   'high',
   'xhigh',
+  'max',
 ] as const
+
+const LEGACY_OPENAI_EFFORT_LEVELS: EffortLevel[] = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+]
 
 export type OpenAIEffortLevel = typeof OPENAI_EFFORT_LEVELS[number]
 // OpenAI-compatible shims also serve providers such as Kimi that accept the
@@ -436,7 +445,8 @@ function legacyModelSupportsEffort(
   // high/max, so advertising effort for them would silently drop
   // low/medium on the wire. The substring match also covers prefix
   // variations (e.g. `claude-opus-4-7`, `opencode-claude-opus-4-8`).
-  if (m.includes('opus-4-5') || m.includes('opus-4-6') ||
+  if (m.includes('claude-opus-5') || m.includes('claude-sonnet-5') ||
+      m.includes('opus-4-5') || m.includes('opus-4-6') ||
       m.includes('opus-4-7') || m.includes('opus-4-8') ||
       m.includes('sonnet-4-6')) {
     return true
@@ -686,14 +696,20 @@ export function resolveOpenAIShimReasoningRequestPlan(options: {
   }
 }
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'max' effort.
-// Per API docs, 'max' is supported on the recent Opus models (4.8/4.7/4.6) for
-// public models — other models return an error.
+// Per API docs, 'max' is supported on Sonnet 5, Opus 5, and recent Opus 4
+// models — other models return an error.
 function legacyModelSupportsMaxEffort(model: string): boolean {
   const supported3P = get3PModelCapabilityOverride(model, 'max_effort')
   if (supported3P !== undefined) {
     return supported3P
   }
-  if (model.toLowerCase().includes('opus-4-6') || model.toLowerCase().includes('opus-4-7') || model.toLowerCase().includes('opus-4-8')) {
+  if (
+    model.toLowerCase().includes('claude-opus-5') ||
+    model.toLowerCase().includes('claude-sonnet-5') ||
+    model.toLowerCase().includes('opus-4-6') ||
+    model.toLowerCase().includes('opus-4-7') ||
+    model.toLowerCase().includes('opus-4-8')
+  ) {
     return true
   }
   if (process.env.USER_TYPE === 'ant' && resolveAntModel(model)) {
@@ -703,8 +719,8 @@ function legacyModelSupportsMaxEffort(model: string): boolean {
 }
 
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'xhigh' effort.
-// xhigh is reserved for OpenAI/Codex models and OpenCode Claude opus 4-7 / 4-8.
-// All other effort-supporting models reject xhigh at the API.
+// xhigh is supported by current Claude 5 models, recent Opus models, and
+// OpenAI/Codex reasoning models. Other Anthropic models reject it.
 function legacyModelSupportsXHighEffort(
   model: string,
   context?: ReasoningControlContext,
@@ -719,7 +735,12 @@ function legacyModelSupportsXHighEffort(
   if (modelUsesOpenAIEffort(model, context)) {
     return true
   }
-  if (model.toLowerCase().includes('opus-4-7') || model.toLowerCase().includes('opus-4-8')) {
+  if (
+    model.toLowerCase().includes('claude-opus-5') ||
+    model.toLowerCase().includes('claude-sonnet-5') ||
+    model.toLowerCase().includes('opus-4-7') ||
+    model.toLowerCase().includes('opus-4-8')
+  ) {
     return true
   }
   return false
@@ -764,11 +785,13 @@ function getLegacyAvailableEffortLevels(
   const m = model.toLowerCase()
   const isOpenCodeNativeFormat = (
     m.includes('claude-opus-4') || m.includes('claude-sonnet-4') ||
+    m.includes('claude-opus-5') || m.includes('claude-sonnet-5') ||
     m.includes('opus-4') || m.includes('sonnet-4') ||
+    m.includes('opus-5') || m.includes('sonnet-5') ||
     m.includes('gemini-3')
   ) && getReasoningApiProvider(context) === 'openai'
   if (modelUsesOpenAIEffort(model, context) && !isOpenCodeNativeFormat) {
-    return [...OPENAI_EFFORT_LEVELS] as EffortLevel[]
+    return [...LEGACY_OPENAI_EFFORT_LEVELS]
   }
   const levels: EffortLevel[] = ['low', 'medium', 'high']
   if (legacyModelSupportsXHighEffort(model, context)) {
@@ -827,6 +850,7 @@ export function getEffortLevelLabel(level: EffortLevel | OpenAIEffortLevel): str
   if (level === 'ultracode') return 'Ultracode'
   if (level === 'xhigh') return 'Extra High'
   if (level === 'max') return 'Max'
+  if (level === 'ultra') return 'Ultra'
   return capitalize(level)
 }
 
@@ -836,6 +860,7 @@ export function openAIEffortToStandard(level: OpenAIEffortLevel): EffortLevel {
 
 export function standardEffortToOpenAI(level: EffortLevel): OpenAIEffortLevel {
   if (level === 'max' || level === 'ultracode') return 'xhigh'
+  if (level === 'ultra') return 'max'
   return level as OpenAIEffortLevel
 }
 
@@ -901,7 +926,8 @@ export function toPersistableEffort(
     value === 'medium' ||
     value === 'high' ||
     value === 'max' ||
-    value === 'xhigh'
+    value === 'xhigh' ||
+    value === 'ultra'
   ) {
     return value
   }
@@ -1009,7 +1035,8 @@ export function resolveAppliedEffort(
       ? modelSupportsXHighEffort(model, context) ? 'xhigh' : 'high'
       : fallback
   }
-  // API rejects 'max' on non-Opus-4.6 Anthropic models — downgrade to 'high'.
+  // API rejects 'max' on models outside the explicit allowlist — downgrade to
+  // 'high'.
   // OpenAI/Codex models use 'max' as the standard form of 'xhigh'; the client
   // shim converts it back to 'xhigh' on the wire, so don't clamp it here.
   if (
@@ -1019,9 +1046,8 @@ export function resolveAppliedEffort(
   ) {
     return 'high'
   }
-  // xhigh is reserved for OpenAI/Codex models and OpenCode opus-4-7/4-8.
-  // For all other models, downgrade to 'high' so a stale persisted setting
-  // doesn't surface as an API error.
+  // For models without xhigh support, downgrade to 'high' so a stale persisted
+  // setting does not surface as an API error.
   if (resolved === 'xhigh' && !modelSupportsXHighEffort(model, context)) {
     return 'high'
   }
@@ -1142,11 +1168,13 @@ export function getEffortLevelDescription(level: EffortLevel | OpenAIEffortLevel
     case 'high':
       return 'Comprehensive implementation with extensive testing and documentation'
     case 'max':
-      return 'Maximum capability with deepest reasoning (Opus 4.8+)'
+      return 'Maximum standard reasoning effort'
     case 'xhigh':
       return 'Extra high reasoning effort for complex tasks'
     case 'ultracode':
       return 'xhigh effort + standing permission for multi-agent orchestration'
+    case 'ultra':
+      return 'Maximum reasoning with proactive multi-agent delegation'
   }
 }
 
@@ -1221,10 +1249,20 @@ function getLegacyDefaultEffortForModel(
   // the model launch DRI and research. Default effort is a sensitive setting
   // that can greatly affect model quality and bashing.
 
-  // Default effort on the recent Opus models (4.8/4.7/4.6) to medium for Pro.
+  // Default effort on Opus 4.8/4.7/4.6 to medium for Pro.
   // Max/Team also get medium when the tengu_grey_step2 config is enabled.
-  // getDefaultOpusModel() now returns opus48 for first-party users.
+  // Opus 5 is deliberately excluded: its API and Claude Code default is high,
+  // and previously selected effort carries over without a model-specific hold.
   const lowerModel = model.toLowerCase()
+  if (
+    lowerModel.includes('claude-opus-5') ||
+    lowerModel.includes('claude-sonnet-5')
+  ) {
+    // Claude 5 models inherit the API default (high). The legacy global
+    // ultrathink fallback below predates adaptive thinking and must not turn
+    // their default into medium.
+    return undefined
+  }
   if (
     lowerModel.includes('opus-4-8') ||
     lowerModel.includes('opus-4-7') ||

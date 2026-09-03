@@ -318,7 +318,9 @@ test('resolveProviderRequest resolves the GPT-5.6 family Codex aliases', () => {
   const sol = resolveProviderRequest({ model: 'gpt-5.6-sol', processEnv: {} })
   expect(sol.resolvedModel).toBe('gpt-5.6-sol')
   expect(sol.transport).toBe('codex_responses')
-  expect(sol.reasoning).toEqual({ effort: 'high' })
+  // Fork policy: the explicit Sol alias starts low; the bare gpt-5.6 alias
+  // below keeps upstream's flagship/high default.
+  expect(sol.reasoning).toEqual({ effort: 'low' })
 
   const terra = resolveProviderRequest({ model: 'gpt-5.6-terra', processEnv: {} })
   expect(terra.resolvedModel).toBe('gpt-5.6-terra')

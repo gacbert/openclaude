@@ -50,6 +50,7 @@ import { getWebSearchTimeoutMs } from '../src/tools/WebSearchTool/providers/time
 import { isFirecrawlCloudApiUrl } from '../src/tools/firecrawl/client.js'
 import { getAPIProvider } from '../src/utils/model/providers.js'
 import { getMainLoopModel } from '../src/utils/model/model.js'
+import { vertexModelSupportsNativeWebSearch } from '../src/utils/model/claudeCapabilities.js'
 
 type CheckResult = {
   ok: boolean
@@ -246,14 +247,6 @@ function formatDuckDuckGoReliabilityDetail(providerMode: string): string {
   return `${providerMode}; DuckDuckGo selected. DuckDuckGo scraping can be rate-limited from datacenter/VPN/repeated-request networks. Configure ${WEB_SEARCH_RELIABLE_BACKEND_ENV_HINT} for reliable search.`
 }
 
-function vertexModelSupportsNativeWebSearch(model: string): boolean {
-  return (
-    model.includes('claude-opus-4') ||
-    model.includes('claude-sonnet-4') ||
-    model.includes('claude-haiku-4')
-  )
-}
-
 function isCodexResponsesWebSearchEnabledForDoctor(): boolean {
   const request = resolveProviderRequest({
     model: getMainLoopModel(),
@@ -289,7 +282,7 @@ function buildNativeWebSearchCheck(): CheckResult {
     }
     return fail(
       'Web search backend',
-      `WEB_SEARCH_PROVIDER=native selected, but vertex model ${safeDisplayValue(model, 'the active model')} does not support native web search. Use a Claude 4 Vertex model or configure ${WEB_SEARCH_RELIABLE_BACKEND_ENV_HINT}.`,
+      `WEB_SEARCH_PROVIDER=native selected, but vertex model ${safeDisplayValue(model, 'the active model')} does not support native web search. Use a supported Claude 4 or Opus 5 Vertex model, or configure ${WEB_SEARCH_RELIABLE_BACKEND_ENV_HINT}.`,
     )
   }
 
@@ -326,7 +319,7 @@ function buildAutoNativeWebSearchCheck(): CheckResult | undefined {
     }
     return fail(
       'Web search backend',
-      `WEB_SEARCH_PROVIDER=auto selected, but vertex model ${safeDisplayValue(model, 'the active model')} does not support native web search and runtime will not use adapter providers in auto mode. Use a Claude 4 Vertex model or set an explicit WEB_SEARCH_PROVIDER adapter mode with ${WEB_SEARCH_RELIABLE_BACKEND_ENV_HINT}.`,
+      `WEB_SEARCH_PROVIDER=auto selected, but vertex model ${safeDisplayValue(model, 'the active model')} does not support native web search and runtime will not use adapter providers in auto mode. Use a supported Claude 4 or Opus 5 Vertex model, or set an explicit WEB_SEARCH_PROVIDER adapter mode with ${WEB_SEARCH_RELIABLE_BACKEND_ENV_HINT}.`,
     )
   }
 

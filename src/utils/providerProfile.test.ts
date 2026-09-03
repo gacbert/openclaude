@@ -187,6 +187,55 @@ test('anthropic launch preserves unmanaged process env values', async () => {
   assert.equal(env.OPENAI_MODEL, undefined)
 })
 
+test('direct Anthropic launch defaults to Sonnet 5 when no model is pinned', async () => {
+  const env = await buildLaunchEnv({
+    profile: 'anthropic',
+    persisted: profile('anthropic', {
+      ANTHROPIC_API_KEY: 'sk-ant-persisted',
+    }),
+    goal: 'balanced',
+    processEnv: {},
+  })
+
+  assert.equal(env.ANTHROPIC_MODEL, 'claude-sonnet-5')
+})
+
+test('custom Anthropic gateways keep the conservative Sonnet fallback', async () => {
+  const env = await buildLaunchEnv({
+    profile: 'anthropic',
+    persisted: profile('anthropic', {
+      ANTHROPIC_BASE_URL: 'https://anthropic-proxy.example/v1',
+      ANTHROPIC_API_KEY: 'proxy-key',
+    }),
+    goal: 'balanced',
+    processEnv: {},
+  })
+
+  assert.equal(env.ANTHROPIC_BASE_URL, 'https://anthropic-proxy.example/v1')
+  assert.equal(env.ANTHROPIC_MODEL, 'claude-sonnet-4-6')
+})
+
+test('built-in Bedrock and Vertex profiles keep their provider Sonnet aliases', async () => {
+  const bedrock = await buildLaunchEnv({
+    profile: 'bedrock',
+    persisted: profile('bedrock', {}),
+    goal: 'balanced',
+    processEnv: {},
+  })
+  assert.equal(
+    bedrock.ANTHROPIC_MODEL,
+    'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+  )
+
+  const vertex = await buildLaunchEnv({
+    profile: 'vertex',
+    persisted: profile('vertex', {}),
+    goal: 'balanced',
+    processEnv: {},
+  })
+  assert.equal(vertex.ANTHROPIC_MODEL, 'claude-sonnet-4-5@20250929')
+})
+
 test('openai launch omits api key when no key is resolved', async () => {
   const env = await buildLaunchEnv({
     profile: 'openai',
@@ -755,7 +804,7 @@ test('openai launch ignores codex shell transport hints', async () => {
   })
 
   assert.equal(env.OPENAI_BASE_URL, 'https://api.openai.com/v1')
-  assert.equal(env.OPENAI_MODEL, 'gpt-5.5')
+  assert.equal(env.OPENAI_MODEL, 'gpt-5.6-terra')
   assert.equal(env.OPENAI_API_KEY, 'sk-live')
 })
 
@@ -774,7 +823,7 @@ test('openai launch ignores codex persisted transport hints', async () => {
   })
 
   assert.equal(env.OPENAI_BASE_URL, 'https://api.openai.com/v1')
-  assert.equal(env.OPENAI_MODEL, 'gpt-5.5')
+  assert.equal(env.OPENAI_MODEL, 'gpt-5.6-terra')
   assert.equal(env.OPENAI_API_KEY, 'sk-live')
 })
 
@@ -2488,7 +2537,7 @@ test('openai profiles ignore codex shell transport hints', () => {
 
   assert.deepEqual(env, {
     OPENAI_BASE_URL: 'https://api.openai.com/v1',
-    OPENAI_MODEL: 'gpt-5.5',
+    OPENAI_MODEL: 'gpt-5.6-terra',
     OPENAI_API_KEY: 'sk-live',
   })
 })
@@ -2550,7 +2599,7 @@ test('openai profiles ignore poisoned shell model and base url values', () => {
 
   assert.deepEqual(env, {
     OPENAI_BASE_URL: 'https://api.openai.com/v1',
-    OPENAI_MODEL: 'gpt-5.5',
+    OPENAI_MODEL: 'gpt-5.6-terra',
     OPENAI_API_KEY: 'sk-live',
   })
 })
@@ -2683,7 +2732,7 @@ test('startup env ignores poisoned persisted openai model and base url', async (
 
   assert.equal(env.CLAUDE_CODE_USE_OPENAI, '1')
   assert.equal(env.OPENAI_API_KEY, 'sk-live')
-  assert.equal(env.OPENAI_MODEL, 'gpt-5.5')
+  assert.equal(env.OPENAI_MODEL, 'gpt-5.6-terra')
   assert.equal(env.OPENAI_BASE_URL, 'https://api.openai.com/v1')
 })
 

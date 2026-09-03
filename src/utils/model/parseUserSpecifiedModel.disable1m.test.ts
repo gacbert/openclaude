@@ -63,7 +63,8 @@ describe('parseUserSpecifiedModel — [1m] tag when 1M context is disabled', () 
   })
 })
 
-// Guard the opposite direction: with 1M enabled (default), the tag is preserved.
+// Guard the opposite direction: with 1M enabled (default), compatibility tags
+// are preserved except for models whose base alias is already natively 1M.
 describe('parseUserSpecifiedModel — [1m] tag when 1M context is enabled', () => {
   const original = process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT
 
@@ -78,9 +79,10 @@ describe('parseUserSpecifiedModel — [1m] tag when 1M context is enabled', () =
     }
   })
 
-  test('sonnet[1m] keeps the tag on the resolved base model', () => {
+  test('native-1M Sonnet 5 normalizes away the redundant tag', () => {
     const base = parseUserSpecifiedModel('sonnet')
-    expect(parseUserSpecifiedModel('sonnet[1m]')).toBe(`${base}[1m]`)
+    expect(base).toBe('claude-sonnet-5')
+    expect(parseUserSpecifiedModel('sonnet[1m]')).toBe(base)
   })
 
   test('custom model id keeps the [1m] suffix', () => {

@@ -51,13 +51,6 @@ import type { CustomAgentDefinition } from '../../tools/AgentTool/loadAgentsDir.
 import { runAgent } from '../../tools/AgentTool/runAgent.js'
 import { awaitClassifierAutoApproval } from '../../tools/BashTool/bashPermissions.js'
 import { BASH_TOOL_NAME } from '../../tools/BashTool/toolName.js'
-import { SEND_MESSAGE_TOOL_NAME } from '../../tools/SendMessageTool/constants.js'
-import { TASK_CREATE_TOOL_NAME } from '../../tools/TaskCreateTool/constants.js'
-import { TASK_GET_TOOL_NAME } from '../../tools/TaskGetTool/constants.js'
-import { TASK_LIST_TOOL_NAME } from '../../tools/TaskListTool/constants.js'
-import { TASK_UPDATE_TOOL_NAME } from '../../tools/TaskUpdateTool/constants.js'
-import { TEAM_CREATE_TOOL_NAME } from '../../tools/TeamCreateTool/constants.js'
-import { TEAM_DELETE_TOOL_NAME } from '../../tools/TeamDeleteTool/constants.js'
 import type { Message } from '../../types/message.js'
 import type { PermissionDecision } from '../../types/permissions.js'
 import {
@@ -117,6 +110,7 @@ import {
 import { unregisterAgent as unregisterPerfettoAgent } from '../telemetry/perfettoTracing.js'
 import { createContentReplacementState } from '../toolResultStorage.js'
 import { TEAM_LEAD_NAME } from './constants.js'
+import { buildInProcessAgentDefinition } from './inProcessAgentDefinition.js'
 import {
   getLeaderSetToolPermissionContext,
   getLeaderToolUseConfirmQueue,
@@ -1069,36 +1063,12 @@ export async function runInProcessTeammate(
   // Resolve agent definition - use full system prompt with teammate addendum
   // IMPORTANT: Set permissionMode to 'default' so teammates always get full tool
   // access regardless of the leader's permission mode.
-  const fallbackModel = agentDefinition?.model ?? model
-  const resolvedAgentDefinition: CustomAgentDefinition = {
-    agentType: identity.agentName,
-    whenToUse: `In-process teammate: ${identity.agentName}`,
-    getSystemPrompt: () => teammateSystemPrompt,
-    // Inject team-essential tools so teammates can always respond to
-    // shutdown requests, send messages, and coordinate via the task list,
-    // even with explicit tool lists
-    tools: agentDefinition?.tools
-      ? [
-          ...new Set([
-            ...agentDefinition.tools,
-            SEND_MESSAGE_TOOL_NAME,
-            TEAM_CREATE_TOOL_NAME,
-            TEAM_DELETE_TOOL_NAME,
-            TASK_CREATE_TOOL_NAME,
-            TASK_GET_TOOL_NAME,
-            TASK_LIST_TOOL_NAME,
-            TASK_UPDATE_TOOL_NAME,
-          ]),
-        ]
-      : ['*'],
-    source: 'projectSettings',
-    permissionMode: 'default',
-    // Propagate model from custom agent definition so getAgentModel()
-    // can use it as a fallback when no tool-level model is specified. If the
-    // spawn layer supplied a default teammate model, keep it as a fallback
-    // without treating it like an explicit Agent tool model override.
-    ...(fallbackModel ? { model: fallbackModel } : {}),
-  }
+  const resolvedAgentDefinition = buildInProcessAgentDefinition({
+    agentName: identity.agentName,
+    teammateSystemPrompt,
+    agentDefinition,
+    defaultModel: model,
+  })
 
   // All messages across all prompts
   const allMessages: Message[] = []

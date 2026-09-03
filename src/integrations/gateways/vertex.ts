@@ -23,7 +23,18 @@ export default defineGateway({
   catalog: {
     source: 'static',
     models: [
-      { id: 'vertex-claude-opus', apiName: 'claude-opus-4-6', label: 'Claude Opus (Vertex)', modelDescriptorId: 'claude-opus-4-6' },
+      {
+        id: 'vertex-claude-opus',
+        apiName: 'claude-opus-5',
+        label: 'Claude Opus 5 (Vertex)',
+        modelDescriptorId: 'claude-opus-5',
+      },
+      {
+        id: 'vertex-claude-sonnet',
+        apiName: 'claude-sonnet-5',
+        label: 'Claude Sonnet 5 (Vertex)',
+        modelDescriptorId: 'claude-sonnet-5',
+      },
     ],
   },
   usage: { supported: false },

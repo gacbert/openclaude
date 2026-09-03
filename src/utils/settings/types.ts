@@ -764,7 +764,7 @@ export const SettingsSchema = lazySchema(() =>
             'enabled automatically for supported models.',
         ),
       effortLevel: z
-        .enum(['low', 'medium', 'high', 'xhigh', 'max'])
+        .enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
         .optional()
         .catch(undefined)
         .describe('Persisted effort level for supported models.'),

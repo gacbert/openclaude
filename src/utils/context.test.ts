@@ -8,6 +8,7 @@ import {
   getContextWindowForModel,
   getModelMaxOutputTokens,
   modelSupports1M,
+  modelUsesDefault1MContext,
   clearSessionContextWindowOverride,
 } from './context.ts'
 
@@ -455,7 +456,6 @@ test('gpt-5.6 family keeps the full window on the direct-OpenAI route', () => {
     expect(getContextWindowForModel(model)).toBe(1_050_000)
   }
 })
-
 test('gpt-5.4 family uses provider-specific context and output caps', () => {
   process.env.CLAUDE_CODE_USE_OPENAI = '1'
   delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
@@ -497,6 +497,42 @@ test('claude opus 4.8 uses the full 1M context window', () => {
   expect(modelSupports1M('claude-opus-4-8')).toBe(true)
   expect(getContextWindowForModel('claude-opus-4-8')).toBe(1_000_000)
   expect(getContextWindowForModel('claude-opus-4-8[1m]')).toBe(1_000_000)
+})
+
+test('Claude 5 models use native 1M context and 64k/128k output limits on first-party', () => {
+  const originalBaseUrl = process.env.ANTHROPIC_BASE_URL
+  const originalBedrock = process.env.CLAUDE_CODE_USE_BEDROCK
+  const originalVertex = process.env.CLAUDE_CODE_USE_VERTEX
+  const originalFoundry = process.env.CLAUDE_CODE_USE_FOUNDRY
+  delete process.env.CLAUDE_CODE_USE_OPENAI
+  delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
+  delete process.env.OPENAI_MODEL
+  delete process.env.ANTHROPIC_BASE_URL
+  delete process.env.CLAUDE_CODE_USE_BEDROCK
+  delete process.env.CLAUDE_CODE_USE_VERTEX
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
+
+  try {
+    for (const model of ['claude-opus-5', 'claude-sonnet-5']) {
+      expect(modelSupports1M(model)).toBe(true)
+      expect(modelUsesDefault1MContext(model)).toBe(true)
+      expect(getContextWindowForModel(model)).toBe(1_000_000)
+      expect(getContextWindowForModel(`${model}[1m]`)).toBe(1_000_000)
+      expect(getModelMaxOutputTokens(model)).toEqual({
+        default: 64_000,
+        upperLimit: 128_000,
+      })
+    }
+  } finally {
+    if (originalBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL
+    else process.env.ANTHROPIC_BASE_URL = originalBaseUrl
+    if (originalBedrock === undefined) delete process.env.CLAUDE_CODE_USE_BEDROCK
+    else process.env.CLAUDE_CODE_USE_BEDROCK = originalBedrock
+    if (originalVertex === undefined) delete process.env.CLAUDE_CODE_USE_VERTEX
+    else process.env.CLAUDE_CODE_USE_VERTEX = originalVertex
+    if (originalFoundry === undefined) delete process.env.CLAUDE_CODE_USE_FOUNDRY
+    else process.env.CLAUDE_CODE_USE_FOUNDRY = originalFoundry
+  }
 })
 
 test('MiniMax-M2.7 uses the shared gateway-safe context cap by default', () => {
@@ -1026,10 +1062,12 @@ test('Anthropic model with high CLAUDE_CODE_MAX_OUTPUT_TOKENS still caps at mode
   expect(getMaxOutputTokensForModel('claude-3-opus')).toBe(4_096)
 })
 
-test('recent Opus models (4.8/4.7/4.6) get the elevated output-token limits (#1769)', () => {
+test('Claude 5 and recent Opus 4 models get the elevated output-token limits', () => {
   // Regression: 4.8/4.7 used to fall through to the generic opus-4 branch and
   // cap at 32k, while the default Opus is now 4.8.
   const elevated = { default: 64_000, upperLimit: 128_000 }
+  expect(getModelMaxOutputTokens('claude-opus-5')).toEqual(elevated)
+  expect(getModelMaxOutputTokens('claude-sonnet-5')).toEqual(elevated)
   expect(getModelMaxOutputTokens('claude-opus-4-8')).toEqual(elevated)
   expect(getModelMaxOutputTokens('claude-opus-4-7')).toEqual(elevated)
   expect(getModelMaxOutputTokens('claude-opus-4-6')).toEqual(elevated)
@@ -1040,14 +1078,14 @@ test('recent Opus models (4.8/4.7/4.6) get the elevated output-token limits (#17
   })
 })
 
-test('modelSupports1M recognizes the current default Opus (4.8) as 1M-capable', () => {
+test('modelSupports1M recognizes Claude 5 and recent Opus 4 models', () => {
   const original = process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT
   delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT
   try {
-    // Regression: the firstParty default session model is claude-opus-4-8[1m]
-    // (getDefaultMainLoopModelSetting), so dropping 4.8 here downgrades a 1M
-    // session to 200K and trips a spurious "Context limit reached" — exactly
-    // what resolveSkillModelOverride relies on this predicate to prevent.
+    expect(modelSupports1M('claude-opus-5')).toBe(true)
+    expect(modelSupports1M('claude-opus-5[1m]')).toBe(true)
+    expect(modelSupports1M('claude-sonnet-5')).toBe(true)
+    expect(modelSupports1M('claude-sonnet-5[1m]')).toBe(true)
     expect(modelSupports1M('claude-opus-4-8')).toBe(true)
     expect(modelSupports1M('claude-opus-4-8[1m]')).toBe(true)
     expect(modelSupports1M('claude-opus-4-7')).toBe(true)

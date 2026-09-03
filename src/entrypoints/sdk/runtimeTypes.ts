@@ -10,7 +10,14 @@
 import type { z } from 'zod/v4'
 import type { Query, QueryOptions } from './query.js'
 
-export type EffortLevel = 'low' | 'medium' | 'high' | 'max' | 'xhigh' | 'ultracode'
+export type EffortLevel =
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'max'
+  | 'xhigh'
+  | 'ultracode'
+  | 'ultra'
 
 // ============================================================================
 // Zod helpers for tool() input schemas

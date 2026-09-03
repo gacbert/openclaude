@@ -217,10 +217,10 @@ export function getGoalDefaultOpenAIModel(goal: RecommendationGoal): string {
     case 'latency':
       return 'gpt-4o-mini'
     case 'coding':
-      return 'gpt-5.5'
+      return 'gpt-5.6-terra'
     case 'balanced':
     default:
-      return 'gpt-5.5'
+      return 'gpt-5.6-terra'
   }
 }
 

@@ -1,4 +1,5 @@
 import { defineModel } from '../define.js'
+import type { ReasoningControlMetadata } from '../descriptors.js'
 
 const gptCapabilities = {
   supportsVision: true,
@@ -14,6 +15,7 @@ function gptModel(
   label: string,
   contextWindow: number,
   maxOutputTokens: number,
+  reasoning?: ReasoningControlMetadata,
 ) {
   return defineModel({
     id,
@@ -22,7 +24,11 @@ function gptModel(
     vendorId: 'openai',
     classification: ['chat', 'vision', 'coding'],
     defaultModel: id,
-    capabilities: gptCapabilities,
+    capabilities: {
+      ...gptCapabilities,
+      supportsReasoning: reasoning !== undefined,
+    },
+    reasoning,
     contextWindow,
     maxOutputTokens,
   })

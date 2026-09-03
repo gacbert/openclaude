@@ -23,9 +23,10 @@ import {
 } from '../constants/betas.js'
 import { OAUTH_BETA_HEADER } from '../constants/oauth.js'
 import { isClaudeAISubscriber } from './auth.js'
-import { has1mContext } from './context.js'
+import { has1mContext, modelUsesDefault1MContext } from './context.js'
 import { isEnvDefinedFalsy, isEnvTruthy } from './envUtils.js'
 import { getCanonicalName } from './model/model.js'
+import { vertexModelSupportsNativeWebSearch } from './model/claudeCapabilities.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import {
   getAPIProvider,
@@ -111,17 +112,10 @@ export function modelSupportsISP(model: string): boolean {
     return !canonical.includes('claude-3-')
   }
   return (
-    canonical.includes('claude-opus-4') || canonical.includes('claude-sonnet-4')
-  )
-}
-
-function vertexModelSupportsWebSearch(model: string): boolean {
-  const canonical = getCanonicalName(model)
-  // Web search only supported on Claude 4.0+ models on Vertex
-  return (
+    canonical.includes('claude-opus-5') ||
+    canonical.includes('claude-sonnet-5') ||
     canonical.includes('claude-opus-4') ||
-    canonical.includes('claude-sonnet-4') ||
-    canonical.includes('claude-haiku-4')
+    canonical.includes('claude-sonnet-4')
   )
 }
 
@@ -136,6 +130,8 @@ export function modelSupportsContextManagement(model: string): boolean {
     return !canonical.includes('claude-3-')
   }
   return (
+    canonical.includes('claude-opus-5') ||
+    canonical.includes('claude-sonnet-5') ||
     canonical.includes('claude-opus-4') ||
     canonical.includes('claude-sonnet-4') ||
     canonical.includes('claude-haiku-4')
@@ -146,6 +142,11 @@ export function modelSupportsContextManagement(model: string): boolean {
 export function modelSupportsStructuredOutputs(model: string): boolean {
   const canonical = getCanonicalName(model)
   const provider = getAPIProvider()
+  // Opus 5 launches structured outputs on the first-party API only. Keep it
+  // out of Foundry's broader allowlist until that provider confirms support.
+  if (canonical.includes('claude-opus-5')) {
+    return provider === 'firstParty' && isFirstPartyAnthropicBaseUrl()
+  }
   // Structured outputs only supported on firstParty and Foundry (not Bedrock/Vertex yet)
   if (
     (provider !== 'firstParty' || !isFirstPartyAnthropicBaseUrl()) &&
@@ -154,6 +155,7 @@ export function modelSupportsStructuredOutputs(model: string): boolean {
     return false
   }
   return (
+    canonical.includes('claude-sonnet-5') ||
     canonical.includes('claude-sonnet-4-6') ||
     canonical.includes('claude-sonnet-4-5') ||
     canonical.includes('claude-opus-4-1') ||
@@ -275,7 +277,7 @@ export const getAllModelBetas = memoize((model: string): string[] => {
   if (isClaudeAISubscriber()) {
     betaHeaders.push(OAUTH_BETA_HEADER)
   }
-  if (has1mContext(model)) {
+  if (has1mContext(model) && !modelUsesDefault1MContext(model)) {
     betaHeaders.push(CONTEXT_1M_BETA_HEADER)
   }
   if (
@@ -367,7 +369,7 @@ export const getAllModelBetas = memoize((model: string): string[] => {
   }
 
   // Add web search beta for Vertex Claude 4.0+ models only
-  if (provider === 'vertex' && vertexModelSupportsWebSearch(model)) {
+  if (provider === 'vertex' && vertexModelSupportsNativeWebSearch(model)) {
     betaHeaders.push(WEB_SEARCH_BETA_HEADER)
   }
   // Foundry only ships models that already support Web Search

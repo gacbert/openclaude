@@ -45,9 +45,12 @@ afterEach(() => {
   }
 })
 
-// --- supportsCodexServiceTier: only gpt-5.5 / gpt-5.4 carry a service tier ---
+// --- supportsCodexServiceTier: Codex catalog models carrying Fast/priority ---
 
-test('supportsCodexServiceTier is true for gpt-5.5 and gpt-5.4 only', () => {
+test('supportsCodexServiceTier includes the GPT-5.6 family plus legacy models', () => {
+  expect(supportsCodexServiceTier('gpt-5.6-sol')).toBe(true)
+  expect(supportsCodexServiceTier('gpt-5.6-terra')).toBe(true)
+  expect(supportsCodexServiceTier('gpt-5.6-luna')).toBe(true)
   expect(supportsCodexServiceTier('gpt-5.5')).toBe(true)
   expect(supportsCodexServiceTier('gpt-5.4')).toBe(true)
   // case-insensitive + effort suffix tolerated
@@ -72,6 +75,9 @@ test('resolveCodexServiceTier returns undefined when the env flag is unset', () 
 
 test('resolveCodexServiceTier returns "priority" for an explicit priority flag on a supported model', () => {
   process.env.OPENCLAUDE_CODEX_SERVICE_TIER = 'priority'
+  expect(resolveCodexServiceTier('gpt-5.6-sol')).toBe('priority')
+  expect(resolveCodexServiceTier('gpt-5.6-terra')).toBe('priority')
+  expect(resolveCodexServiceTier('gpt-5.6-luna')).toBe('priority')
   expect(resolveCodexServiceTier('gpt-5.5')).toBe('priority')
   expect(resolveCodexServiceTier('gpt-5.4')).toBe('priority')
 })
@@ -97,10 +103,10 @@ test('resolveCodexServiceTier rejects unknown tier values', () => {
 
 // --- resolveProviderRequest: serviceTier threads onto the resolved request ---
 
-test('resolveProviderRequest attaches serviceTier=priority for gpt-5.5 when opted in', () => {
+test('resolveProviderRequest attaches serviceTier=priority for Terra when opted in', () => {
   process.env.OPENCLAUDE_CODEX_SERVICE_TIER = 'priority'
-  const resolved = resolveProviderRequest({ model: 'gpt-5.5' })
-  expect(resolved.resolvedModel).toBe('gpt-5.5')
+  const resolved = resolveProviderRequest({ model: 'gpt-5.6-terra' })
+  expect(resolved.resolvedModel).toBe('gpt-5.6-terra')
   expect(resolved.serviceTier).toBe('priority')
 })
 

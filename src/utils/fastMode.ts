@@ -22,7 +22,6 @@ import { logForDebugging } from './debug.js'
 import { isEnvTruthy } from './envUtils.js'
 import {
   getDefaultMainLoopModelSetting,
-  isOpus1mMergeEnabled,
   type ModelSetting,
   parseUserSpecifiedModel,
 } from './model/model.js'
@@ -140,10 +139,11 @@ export function getFastModeUnavailableReason(): string | null {
 }
 
 // @[MODEL LAUNCH]: Update supported Fast Mode models.
-export const FAST_MODE_MODEL_DISPLAY = 'Opus 4.8'
+export const FAST_MODE_MODEL_DISPLAY = 'Opus 5'
+export const FAST_MODE_SUPPORTED_MODELS_DISPLAY = 'Opus 5 and Opus 4.8'
 
 export function getFastModeModel(): string {
-  return 'opus' + (isOpus1mMergeEnabled() ? '[1m]' : '')
+  return 'opus'
 }
 
 export function getInitialFastModeSetting(model: ModelSetting): boolean {
@@ -172,13 +172,10 @@ export function isFastModeSupportedByModel(
   }
   const model = modelSetting ?? getDefaultMainLoopModelSetting()
   const parsedModel = parseUserSpecifiedModel(model).toLowerCase()
-  // Fast mode is available on the recent Opus models (4.8/4.7/4.6); the default
-  // Opus is now 4.8, so the predicate must match it or the UI ("Opus 4.8 only")
-  // and runtime behavior disagree for Max/Team Premium users.
+  // Fast mode is currently available only on Opus 5 and Opus 4.8.
   return (
-    parsedModel.includes('opus-4-8') ||
-    parsedModel.includes('opus-4-7') ||
-    parsedModel.includes('opus-4-6')
+    parsedModel.includes('claude-opus-5') ||
+    parsedModel.includes('opus-4-8')
   )
 }
 

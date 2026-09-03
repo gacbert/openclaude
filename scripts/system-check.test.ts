@@ -401,7 +401,7 @@ describe('system-check WebSearch diagnostics', () => {
 
     expectWebSearchBackend(
       false,
-      `WEB_SEARCH_PROVIDER=auto selected, but vertex model claude-3-7-sonnet@20250219 does not support native web search and runtime will not use adapter providers in auto mode. Use a Claude 4 Vertex model or set an explicit WEB_SEARCH_PROVIDER adapter mode with ${reliableBackendHint}.`,
+      `WEB_SEARCH_PROVIDER=auto selected, but vertex model claude-3-7-sonnet@20250219 does not support native web search and runtime will not use adapter providers in auto mode. Use a supported Claude 4 or Opus 5 Vertex model, or set an explicit WEB_SEARCH_PROVIDER adapter mode with ${reliableBackendHint}.`,
       false,
     )
   })
@@ -413,7 +413,18 @@ describe('system-check WebSearch diagnostics', () => {
 
     expectWebSearchBackend(
       false,
-      `WEB_SEARCH_PROVIDER=auto selected, but vertex model claude-3-7-sonnet@20250219 does not support native web search and runtime will not use adapter providers in auto mode. Use a Claude 4 Vertex model or set an explicit WEB_SEARCH_PROVIDER adapter mode with ${reliableBackendHint}. Configured API-backed providers: brave.`,
+      `WEB_SEARCH_PROVIDER=auto selected, but vertex model claude-3-7-sonnet@20250219 does not support native web search and runtime will not use adapter providers in auto mode. Use a supported Claude 4 or Opus 5 Vertex model, or set an explicit WEB_SEARCH_PROVIDER adapter mode with ${reliableBackendHint}. Configured API-backed providers: brave.`,
+      false,
+    )
+  })
+
+  test('reports Opus 5 as a supported Vertex native-search model', () => {
+    process.env.CLAUDE_CODE_USE_VERTEX = '1'
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'claude-opus-5'
+
+    expectWebSearchBackend(
+      true,
+      'WEB_SEARCH_PROVIDER=auto; vertex native web search will be used before adapter providers for claude-opus-5.',
       false,
     )
   })

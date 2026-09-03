@@ -12,6 +12,10 @@ import { getCanonicalName } from './model/model.js'
 import { getModelCapability } from './model/modelCapabilities.js'
 import { resolveAntModel } from './model/antModels.js'
 import { getActiveProviderProfile } from './providerProfiles.js'
+import {
+  getAPIProvider,
+  isFirstPartyAnthropicBaseUrl,
+} from './model/providers.js'
 
 // Model context window size (200k tokens for all models right now)
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
@@ -153,20 +157,37 @@ export function modelSupports1M(model: string): boolean {
   }
   const canonical = getCanonicalName(model)
   return (
+    canonical.includes('claude-sonnet-5') ||
     canonical.includes('claude-sonnet-4') ||
+    canonical.includes('claude-opus-5') ||
     canonical.includes('opus-4-6') ||
     canonical.includes('opus-4-7') ||
     canonical.includes('opus-4-8')
   )
 }
 
-// gacbert patch: Opus 4.8 gets its 1M window by default (no [1m] suffix or
-// beta header needed) — upstream still gates 1M behind has1mContext().
-function modelUsesDefault1MContext(model: string): boolean {
+// Current native-1M models expose their full windows without a [1m] suffix or
+// beta header. Keep this separate from modelSupports1M(), which also covers
+// older models whose extended window still requires an explicit opt-in.
+export function modelUsesDefault1MContext(model: string): boolean {
   if (is1mContextDisabled()) {
     return false
   }
   const canonical = getCanonicalName(model)
+  if (canonical.includes('claude-sonnet-5')) {
+    const provider = getAPIProvider()
+    return (
+      (provider === 'firstParty' && isFirstPartyAnthropicBaseUrl()) ||
+      provider === 'bedrock' ||
+      provider === 'vertex' ||
+      provider === 'foundry'
+    )
+  }
+  if (canonical.includes('claude-opus-5')) {
+    return (
+      getAPIProvider() === 'firstParty' && isFirstPartyAnthropicBaseUrl()
+    )
+  }
   return canonical.includes('opus-4-8')
 }
 
@@ -401,6 +422,8 @@ export function getModelMaxOutputTokens(model: string): {
   const m = getCanonicalName(model)
 
   if (
+    m.includes('claude-opus-5') ||
+    m.includes('claude-sonnet-5') ||
     m.includes('opus-4-8') ||
     m.includes('opus-4-7') ||
     m.includes('opus-4-6')

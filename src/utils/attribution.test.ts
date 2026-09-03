@@ -196,7 +196,7 @@ describe('getDefaultCommitCoAuthorName', () => {
         apiProvider: 'firstParty',
         isInternalRepo: false,
       }),
-    ).toBe('Claude Opus 4.8')
+    ).toBe('Claude Opus 5')
   })
 
   it('sanitizes unknown internal Claude co-author names', () => {
@@ -221,6 +221,16 @@ describe('getDefaultCommitCoAuthorName', () => {
         isInternalRepo: false,
       }),
     ).toBe('Claude Opus 4.6')
+  })
+
+  it('uses the public Sonnet 5 name for first-party attribution', () => {
+    expect(
+      getDefaultCommitCoAuthorName({
+        model: 'claude-sonnet-5',
+        apiProvider: 'firstParty',
+        isInternalRepo: false,
+      }),
+    ).toBe('Claude Sonnet 5')
   })
 
   it('uses the OpenClaude email for commit attribution across providers', () => {

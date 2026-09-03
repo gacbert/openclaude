@@ -121,14 +121,32 @@ describe('modelSupportsAdaptiveThinking — Claude 4 allowlist', () => {
   // Provider is mocked to 'openai', so unknown Claude models default to false.
   // That makes the allowlist the only reason opus-4-8 returns true here, so
   // this test fails if opus-4-8 is dropped from the allowlist (#1769).
-  test('includes Opus 4.8 in the adaptive-thinking allowlist', async () => {
-    const { modelSupportsAdaptiveThinking } = await importFreshThinkingModule()
+  test('includes current Opus and Sonnet models in the adaptive-thinking allowlist', async () => {
+    const {
+      modelCapsEffortWhenThinkingDisabled,
+      modelDefaultsToAdaptiveThinking,
+      modelOnlySupportsAdaptiveThinking,
+      modelSupportsAdaptiveThinking,
+    } = await importFreshThinkingModule()
 
+    expect(modelSupportsAdaptiveThinking('claude-opus-5')).toBe(true)
+    expect(modelSupportsAdaptiveThinking('claude-sonnet-5')).toBe(true)
     expect(modelSupportsAdaptiveThinking('claude-opus-4-8')).toBe(true)
     // 4.7 stays supported (guards against an accidental allowlist rewrite).
     expect(modelSupportsAdaptiveThinking('claude-opus-4-7')).toBe(true)
     // A non-allowlisted Claude 4 opus is still excluded on non-1P providers.
     expect(modelSupportsAdaptiveThinking('claude-opus-4-2')).toBe(false)
+
+    expect(modelDefaultsToAdaptiveThinking('claude-opus-5')).toBe(true)
+    expect(modelDefaultsToAdaptiveThinking('claude-sonnet-5')).toBe(true)
+    expect(modelDefaultsToAdaptiveThinking('claude-opus-4-8')).toBe(false)
+    expect(modelOnlySupportsAdaptiveThinking('claude-opus-5')).toBe(true)
+    expect(modelOnlySupportsAdaptiveThinking('claude-sonnet-5')).toBe(true)
+    expect(modelOnlySupportsAdaptiveThinking('claude-opus-4-8')).toBe(true)
+    expect(modelOnlySupportsAdaptiveThinking('claude-opus-4-7')).toBe(true)
+    expect(modelOnlySupportsAdaptiveThinking('claude-opus-4-6')).toBe(false)
+    expect(modelCapsEffortWhenThinkingDisabled('claude-opus-5')).toBe(true)
+    expect(modelCapsEffortWhenThinkingDisabled('claude-sonnet-5')).toBe(false)
   })
 })
 

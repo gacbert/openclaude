@@ -14,9 +14,9 @@ import {
 /**
  * Migrate users who had "sonnet[1m]" saved to the explicit "sonnet-4-5-20250929[1m]".
  *
- * The "sonnet" alias now resolves to Sonnet 4.6, so users who previously set
- * "sonnet[1m]" (targeting Sonnet 4.5 with 1M context) need to be pinned to the
- * explicit version to preserve their intended model.
+ * When this historical migration was introduced, the "sonnet" alias moved to
+ * Sonnet 4.6. Users who had selected "sonnet[1m]" to target Sonnet 4.5 were
+ * pinned to the explicit version so later alias launches preserve that intent.
  *
  * This is needed because Sonnet 4.6 1M was offered to a different group of users than
  * Sonnet 4.5 1M, so we needed to pin existing sonnet[1m] users to Sonnet 4.5 1M.

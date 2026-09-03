@@ -17,6 +17,7 @@ import {
   has1mContext,
   is1mContextDisabled,
   modelSupports1M,
+  modelUsesDefault1MContext,
 } from '../context.js'
 import { isEnvTruthy } from '../envUtils.js'
 import { getModelStrings, resolveOverriddenModel } from './modelStrings.js'
@@ -105,7 +106,8 @@ export function isNonCustomOpusModel(model: ModelName): boolean {
     model === getModelStrings().opus45 ||
     model === getModelStrings().opus46 ||
     model === getModelStrings().opus47 ||
-    model === getModelStrings().opus48
+    model === getModelStrings().opus48 ||
+    model === getModelStrings().opus50
   )
 }
 
@@ -207,9 +209,9 @@ export function getDefaultOpusModel(): ModelName {
   if (getAPIProvider() === 'openai') {
     return process.env.OPENAI_MODEL || 'gpt-4o'
   }
-  // Codex provider: use user-specified model or default to gpt-5.5
+  // Codex provider: use user-specified model or default to GPT-5.6 Terra.
   if (getAPIProvider() === 'codex') {
-    return process.env.OPENAI_MODEL || 'gpt-5.5'
+    return process.env.OPENAI_MODEL || 'gpt-5.6-terra'
   }
   // GitHub Copilot provider
   if (getAPIProvider() === 'github') {
@@ -231,13 +233,21 @@ export function getDefaultOpusModel(): ModelName {
   if (getAPIProvider() === 'xai') {
     return process.env.OPENAI_MODEL || 'grok-4.3'
   }
-  // 3P providers (Bedrock, Vertex, Foundry) — kept as a separate branch
-  // since 3P availability lags firstParty and these will diverge again at
-  // the next model launch. Keep 3P on Opus 4.7 until they roll out 4.8.
+  // Microsoft Foundry's built-in `opus` deployment remains on Opus 4.6.
+  // An explicitly deployed Opus 5 can still be selected by full name or via
+  // ANTHROPIC_DEFAULT_OPUS_MODEL.
+  if (getAPIProvider() === 'foundry') {
+    return getModelStrings().opus46
+  }
+  // Bedrock and Vertex ship Opus 5 as their current Opus alias.
+  if (getAPIProvider() === 'bedrock' || getAPIProvider() === 'vertex') {
+    return getModelStrings().opus50
+  }
+  // Custom Anthropic-compatible gateways may lag the first-party launch.
   if (!isFirstPartyAnthropicProvider()) {
     return getModelStrings().opus47
   }
-  return getModelStrings().opus48
+  return getModelStrings().opus50
 }
 
 // @[MODEL LAUNCH]: Update the default Sonnet model (3P providers may lag so keep defaults unchanged).
@@ -259,7 +269,7 @@ export function getDefaultSonnetModel(): ModelName {
   }
   // Codex provider
   if (getAPIProvider() === 'codex') {
-    return process.env.OPENAI_MODEL || 'gpt-5.5'
+    return process.env.OPENAI_MODEL || 'gpt-5.6-terra'
   }
   // GitHub Copilot provider
   if (getAPIProvider() === 'github') {
@@ -281,11 +291,16 @@ export function getDefaultSonnetModel(): ModelName {
   if (getAPIProvider() === 'xai') {
     return process.env.OPENAI_MODEL || 'grok-4.3'
   }
-  // Default to Sonnet 4.5 for 3P since they may not have 4.6 yet
+  // Custom Claude Platform-compatible gateways use the current gateway alias,
+  // while built-in Bedrock/Vertex/Foundry aliases remain more conservative.
+  if (isCustomAnthropicProvider()) {
+    return getModelStrings().sonnet46
+  }
+  // Users can still pin Sonnet 5 by full provider ID.
   if (!isFirstPartyAnthropicProvider()) {
     return getModelStrings().sonnet45
   }
-  return getModelStrings().sonnet46
+  return getModelStrings().sonnet50
 }
 
 // @[MODEL LAUNCH]: Update the default Haiku model (3P providers may lag so keep defaults unchanged).
@@ -303,7 +318,7 @@ export function getDefaultHaikuModel(): ModelName {
   }
   // Codex provider
   if (getAPIProvider() === 'codex') {
-    return process.env.OPENAI_MODEL || 'gpt-5.5'
+    return process.env.OPENAI_MODEL || 'gpt-5.6-terra'
   }
   // GitHub Copilot provider
   if (getAPIProvider() === 'github') {
@@ -368,7 +383,8 @@ export function getRuntimeMainLoopModel(params: {
  *
  * This handles the built-in default:
  * - Opus for Max and Team Premium users
- * - Sonnet 4.6 for all other users (including Team Standard, Pro, Enterprise)
+ * - Sonnet 5 for all other first-party users (including Team Standard, Pro,
+ *   Enterprise, and direct API users)
  *
  * @returns The default model setting to use
  */
@@ -399,9 +415,9 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
   if (getAPIProvider() === 'openai') {
     return process.env.OPENAI_MODEL || 'gpt-4o'
   }
-  // Codex provider: always use the configured Codex model (default gpt-5.5)
+  // Codex provider: always use the configured Codex model (default Terra).
   if (getAPIProvider() === 'codex') {
-    return process.env.OPENAI_MODEL || 'gpt-5.5'
+    return process.env.OPENAI_MODEL || 'gpt-5.6-terra'
   }
   // NVIDIA NIM uses OpenAI-compatible model ids. Keep this fallback aligned
   // with the route descriptor so headless sessions never send a Claude model.
@@ -428,12 +444,11 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
     return process.env.OPENAI_MODEL || 'mimo-v2.5-pro'
   }
 
-  // Ants default to defaultModel from flag config, or Opus 1M if not configured
+  // Ants default to defaultModel from flag config, or the current Opus model.
   if (process.env.USER_TYPE === 'ant') {
-    return (
-      getAntModelOverrideConfig()?.defaultModel ??
-      getDefaultOpusModel() + '[1m]'
-    )
+    const opus = getDefaultOpusModel()
+    return getAntModelOverrideConfig()?.defaultModel ??
+      (modelUsesDefault1MContext(opus) ? opus : opus + '[1m]')
   }
 
   // Max users get Opus as default
@@ -468,8 +483,11 @@ export function getDefaultMainLoopModel(): ModelName {
  */
 export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
   name = name.toLowerCase()
-  // Special cases for Claude 4+ models to differentiate versions
-  // Order matters: check more specific versions first (4-8 before 4-7 before 4-6 before 4-5 before 4)
+  // Special cases for current Claude models. Order matters: newer and more
+  // specific versions must be checked before older families.
+  if (name.includes('claude-opus-5')) {
+    return 'claude-opus-5'
+  }
   if (name.includes('claude-opus-4-8')) {
     return 'claude-opus-4-8'
   }
@@ -487,6 +505,9 @@ export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
   }
   if (name.includes('claude-opus-4')) {
     return 'claude-opus-4'
+  }
+  if (name.includes('claude-sonnet-5')) {
+    return 'claude-sonnet-5'
   }
   if (name.includes('claude-sonnet-4-6')) {
     return 'claude-sonnet-4-6'
@@ -545,19 +566,18 @@ export function getClaudeAiUserDefaultModelDescription(
   fastMode = false,
 ): string {
   if (isMaxSubscriber() || isTeamPremiumSubscriber()) {
-    if (isOpus1mMergeEnabled()) {
-      return `Opus 4.8 with 1M context · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`
-    }
-    return `Opus 4.8 · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`
+    const opus = getDefaultOpusModel()
+    return `Opus 5${modelUsesDefault1MContext(opus) ? ' with 1M context' : ''} · Powerful for complex agentic work${fastMode ? getOpus46PricingSuffix(true) : ''}`
   }
-  return 'Sonnet 4.6 · Best for everyday tasks'
+  const sonnet = getDefaultSonnetModel()
+  return `Sonnet 5${modelUsesDefault1MContext(sonnet) ? ' with 1M context' : ''} · Best for everyday tasks`
 }
 
 export function renderDefaultModelSetting(
   setting: ModelName | ModelAlias,
 ): string {
   if (setting === 'opusplan') {
-    return 'Opus 4.8 in plan mode, else Sonnet 4.6'
+    return 'Opus 5 in plan mode, else Sonnet 5'
   }
   return renderModelName(parseUserSpecifiedModel(setting))
 }
@@ -570,6 +590,11 @@ export function getOpus46PricingSuffix(fastMode: boolean): string {
 }
 
 export function isOpus1mMergeEnabled(): boolean {
+  // Opus 5 is natively 1M on the first-party API, so it has no separate
+  // context variant to merge, migrate to, or advertise.
+  if (modelUsesDefault1MContext(getDefaultOpusModel())) {
+    return false
+  }
   if (
     is1mContextDisabled() ||
     isProSubscriber() ||
@@ -595,7 +620,7 @@ export function renderModelSetting(setting: ModelName | ModelAlias): string {
   }
   // Handle Codex models - show actual model name + resolved model
   if (setting === 'codexplan') {
-    return 'codexplan (gpt-5.5)'
+    return 'codexplan (gpt-5.6-terra)'
   }
   if (setting === 'codexspark') {
     return 'codexspark (gpt-5.3-codex-spark)'
@@ -642,8 +667,10 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
       'gpt-5.1-codex-mini': 'GPT-5.1 Codex mini',
       'gpt-4o': 'GPT-4o',
       'gpt-4.1': 'GPT-4.1',
+      'claude-opus-5': 'Claude Opus 5',
       'claude-opus-4.6': 'Claude Opus 4.6',
       'claude-opus-4.5': 'Claude Opus 4.5',
+      'claude-sonnet-5': 'Claude Sonnet 5',
       'claude-sonnet-4.6': 'Claude Sonnet 4.6',
       'claude-sonnet-4.5': 'Claude Sonnet 4.5',
       'claude-haiku-4.5': 'Claude Haiku 4.5',
@@ -674,6 +701,9 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
       return 'GPT-5.4'
     case 'gpt-5.3-codex-spark':
       return 'GPT-5.3 Codex Spark'
+    case getModelStrings().opus50 + '[1m]':
+    case getModelStrings().opus50:
+      return 'Opus 5'
     case getModelStrings().opus48 + '[1m]':
       return 'Opus 4.8 (1M context)'
     case getModelStrings().opus48:
@@ -692,6 +722,9 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
       return 'Opus 4.1'
     case getModelStrings().opus40:
       return 'Opus 4'
+    case getModelStrings().sonnet50 + '[1m]':
+    case getModelStrings().sonnet50:
+      return 'Sonnet 5'
     case getModelStrings().sonnet46 + '[1m]':
       return 'Sonnet 4.6 (1M context)'
     case getModelStrings().sonnet46:
@@ -810,6 +843,9 @@ export function parseUserSpecifiedModel(
   // matter where it came from, while still honoring an env default's opt-in.
   const applyOneMTag = (resolved: ModelName): ModelName => {
     const base = resolved.replace(/\[1m]$/i, '').trim()
+    if (modelUsesDefault1MContext(base)) {
+      return base
+    }
     return has1mTag || has1mContext(resolved) ? base + '[1m]' : base
   }
 
@@ -835,7 +871,7 @@ export function parseUserSpecifiedModel(
   // silently shrink a `codexplan[1m]`/`codexspark[1m]` session back to the
   // model default.
   if (modelString === 'codexplan') {
-    return 'gpt-5.5' + (has1mTag ? '[1m]' : '')
+    return 'gpt-5.6-terra' + (has1mTag ? '[1m]' : '')
   }
   if (modelString === 'codexspark') {
     return 'gpt-5.3-codex-spark' + (has1mTag ? '[1m]' : '')
@@ -888,8 +924,12 @@ export function parseUserSpecifiedModel(
   // only when 1M is active — when disabled, a custom `mydeploy[1m]` must resolve
   // to the base `mydeploy`, not an unservable `mydeploy[1m]` model id.
   if (hasTagSyntax) {
+    const base = modelInputTrimmed.replace(/\[1m\]$/i, '').trim()
+    if (modelUsesDefault1MContext(base)) {
+      return base
+    }
     return (
-      modelInputTrimmed.replace(/\[1m\]$/i, '').trim() +
+      base +
       (has1mTag ? '[1m]' : '')
     )
   }
@@ -970,6 +1010,9 @@ export function getMarketingNameForModel(modelId: string): string | undefined {
   const has1m = modelId.toLowerCase().includes('[1m]')
   const canonical = getCanonicalName(modelId)
 
+  if (canonical.includes('claude-opus-5')) {
+    return 'Opus 5'
+  }
   if (canonical.includes('claude-opus-4-8')) {
     return has1m ? 'Opus 4.8 (with 1M context)' : 'Opus 4.8'
   }
@@ -987,6 +1030,9 @@ export function getMarketingNameForModel(modelId: string): string | undefined {
   }
   if (canonical.includes('claude-opus-4')) {
     return 'Opus 4'
+  }
+  if (canonical.includes('claude-sonnet-5')) {
+    return 'Sonnet 5'
   }
   if (canonical.includes('claude-sonnet-4-6')) {
     return has1m ? 'Sonnet 4.6 (with 1M context)' : 'Sonnet 4.6'

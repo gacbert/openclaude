@@ -44,6 +44,7 @@ import {
   resolveAppliedEffort,
 } from '../../utils/effort.js'
 import { isBilledAsExtraUsage } from '../../utils/extraUsage.js'
+import { modelUsesDefault1MContext } from '../../utils/context.js'
 import {
   clearFastModeCooldown,
   isFastModeAvailable,
@@ -65,6 +66,8 @@ import { buildRouteCatalogModelOptions, mergeRouteCatalogEntries } from '../../u
 import { discoverOpenAICompatibleModelOptions } from '../../utils/model/openaiModelDiscovery.js'
 import {
   getDefaultMainLoopModelSetting,
+  getDefaultOpusModel,
+  getDefaultSonnetModel,
   isOpus1mMergeEnabled,
   renderDefaultModelSetting,
 } from '../../utils/model/model.js'
@@ -1145,6 +1148,7 @@ function isOpus1mUnavailable(model: string): boolean {
   return (
     !checkOpus1mAccess() &&
     !isOpus1mMergeEnabled() &&
+    !modelUsesDefault1MContext(getDefaultOpusModel()) &&
     normalized.includes('opus') &&
     normalized.includes('[1m]')
   )
@@ -1154,6 +1158,7 @@ function isSonnet1mUnavailable(model: string): boolean {
   const normalized = model.toLowerCase()
   return (
     !checkSonnet1mAccess() &&
+    !modelUsesDefault1MContext(getDefaultSonnetModel()) &&
     (normalized.includes('sonnet[1m]') ||
       normalized.includes('sonnet-4-6[1m]'))
   )

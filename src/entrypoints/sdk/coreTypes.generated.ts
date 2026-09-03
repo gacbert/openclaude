@@ -1470,7 +1470,7 @@ export type ModelInfo = {
   displayName: string
   description: string
   supportsEffort?: boolean
-  supportedEffortLevels?: ("low" | "medium" | "high" | "xhigh" | "max" | "ultracode")[]
+  supportedEffortLevels?: ("low" | "medium" | "high" | "xhigh" | "max" | "ultracode" | "ultra")[]
   supportsAdaptiveThinking?: boolean
   supportsFastMode?: boolean
   supportsAutoMode?: boolean
@@ -1535,7 +1535,7 @@ export type AgentDefinition = {
   maxSteps?: number
   background?: boolean
   memory?: "user" | "project" | "local"
-  effort?: "low" | "medium" | "high" | "xhigh" | "max" | number
+  effort?: "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | number
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "fullAccess" | "plan" | "dontAsk"
 }
 

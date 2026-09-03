@@ -36,7 +36,7 @@ afterEach(() => {
 })
 
 async function importFreshEffortModule(options: {
-  provider: 'codex' | 'openai'
+  provider: 'codex' | 'openai' | 'firstParty' | 'bedrock' | 'vertex'
   supportsCodexReasoningEffort: boolean
   routeId?: string
   catalogEntries?: any[]
@@ -275,13 +275,14 @@ test('toPersistableEffort passes xhigh through as a first-class level', async ()
 
   expect(toPersistableEffort('xhigh')).toBe('xhigh')
   expect(toPersistableEffort('max')).toBe('max')
+  expect(toPersistableEffort('ultra')).toBe('ultra')
   expect(toPersistableEffort('high')).toBe('high')
   expect(toPersistableEffort('medium')).toBe('medium')
   expect(toPersistableEffort('low')).toBe('low')
   expect(toPersistableEffort(undefined)).toBeUndefined()
 })
 
-test('standardEffortToOpenAI maps max to xhigh for shim payload', async () => {
+test('standardEffortToOpenAI keeps max=xhigh and reserves max wire effort for Ultra', async () => {
   const { standardEffortToOpenAI, openAIEffortToStandard } =
     await importFreshEffortModule({
       provider: 'openai',
@@ -289,10 +290,67 @@ test('standardEffortToOpenAI maps max to xhigh for shim payload', async () => {
     })
 
   expect(standardEffortToOpenAI('max')).toBe('xhigh')
+  expect(standardEffortToOpenAI('ultra')).toBe('max')
   expect(standardEffortToOpenAI('xhigh')).toBe('xhigh')
   expect(standardEffortToOpenAI('high')).toBe('high')
   expect(openAIEffortToStandard('xhigh')).toBe('xhigh')
   expect(openAIEffortToStandard('high')).toBe('high')
+})
+
+test('GPT-5.6 Terra and Sol advertise Ultra while Luna stops at max', async () => {
+  const { getAvailableEffortLevels, getDefaultEffortForModel } =
+    await importFreshEffortModule({
+      provider: 'codex',
+      supportsCodexReasoningEffort: true,
+      routeId: 'codex',
+      catalogEntries: [
+        { id: 'gpt-5.6-sol', apiName: 'gpt-5.6-sol', modelDescriptorId: 'gpt-5.6-sol' },
+        { id: 'gpt-5.6-terra', apiName: 'gpt-5.6-terra', modelDescriptorId: 'gpt-5.6-terra' },
+        { id: 'gpt-5.6-luna', apiName: 'gpt-5.6-luna', modelDescriptorId: 'gpt-5.6-luna' },
+      ],
+      modelDescriptors: {
+        'gpt-5.6-sol': {
+          capabilities: { supportsReasoning: true },
+          reasoning: {
+            mode: 'levels',
+            levels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+            defaultLevel: 'low',
+            wireFormat: 'reasoning_effort',
+          },
+        },
+        'gpt-5.6-terra': {
+          capabilities: { supportsReasoning: true },
+          reasoning: {
+            mode: 'levels',
+            levels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+            defaultLevel: 'medium',
+            wireFormat: 'reasoning_effort',
+          },
+        },
+        'gpt-5.6-luna': {
+          capabilities: { supportsReasoning: true },
+          reasoning: {
+            mode: 'levels',
+            levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+            defaultLevel: 'medium',
+            wireFormat: 'reasoning_effort',
+          },
+        },
+      },
+    })
+
+  expect(getAvailableEffortLevels('gpt-5.6-sol')).toEqual([
+    'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+  ])
+  expect(getAvailableEffortLevels('gpt-5.6-terra')).toEqual([
+    'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+  ])
+  expect(getAvailableEffortLevels('gpt-5.6-luna')).toEqual([
+    'low', 'medium', 'high', 'xhigh', 'max',
+  ])
+  expect(getDefaultEffortForModel('gpt-5.6-sol')).toBe('low')
+  expect(getDefaultEffortForModel('gpt-5.6-terra')).toBe('medium')
+  expect(getDefaultEffortForModel('gpt-5.6-luna')).toBe('medium')
 })
 
 test('e2e: xhigh → persisted xhigh → resolveAppliedEffort → wire xhigh on OpenAI/Codex (no high clamp)', async () => {
@@ -317,21 +375,25 @@ test('e2e: xhigh → persisted xhigh → resolveAppliedEffort → wire xhigh on 
   expect(standardEffortToOpenAI(applied as 'xhigh')).toBe('xhigh')
 })
 
-test('e2e: max on non-Opus Anthropic model still clamps to high', async () => {
+test('Sonnet 5 supports xhigh/max while legacy Sonnet max still clamps to high', async () => {
   const { resolveAppliedEffort } = await importFreshEffortModule({
     provider: 'firstParty' as unknown as 'openai',
     supportsCodexReasoningEffort: false,
   })
 
   expect(resolveAppliedEffort('claude-sonnet-4-6', 'max')).toBe('high')
+  expect(resolveAppliedEffort('claude-sonnet-5', 'xhigh')).toBe('xhigh')
+  expect(resolveAppliedEffort('claude-sonnet-5', 'max')).toBe('max')
 })
 
-test('modelSupportsXHighEffort: opus-4-7 and opus-4-8 are allowed; other Claude models are not', async () => {
+test('modelSupportsXHighEffort: Claude 5 and recent Opus models are allowed', async () => {
   const { modelSupportsXHighEffort } = await importFreshEffortModule({
     provider: 'firstParty' as unknown as 'openai',
     supportsCodexReasoningEffort: false,
   })
 
+  expect(modelSupportsXHighEffort('claude-opus-5')).toBe(true)
+  expect(modelSupportsXHighEffort('claude-sonnet-5')).toBe(true)
   expect(modelSupportsXHighEffort('claude-opus-4-7')).toBe(true)
   expect(modelSupportsXHighEffort('claude-opus-4-8')).toBe(true)
   expect(modelSupportsXHighEffort('opencode-claude-opus-4-8')).toBe(true)
@@ -356,14 +418,50 @@ test('xhigh does not appear in available levels for non-supporting models', asyn
   ])
   expect(getAvailableEffortLevels('claude-haiku-4-5')).toEqual([])
 
-  // Has xhigh AND max AND ultracode (opus-4-8 on firstParty)
-  const opusLevels = getAvailableEffortLevels('claude-opus-4-8')
+  // Opus 5 exposes low through max plus first-party ultracode.
+  const opusLevels = getAvailableEffortLevels('claude-opus-5')
   expect(opusLevels).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'])
+  expect(getAvailableEffortLevels('claude-sonnet-5')).toEqual([
+    'low', 'medium', 'high', 'xhigh', 'max', 'ultracode',
+  ])
+})
+
+test('catalog-backed Sonnet 5 routes retain the full Anthropic effort range', async () => {
+  const { getAvailableEffortLevels, resolveAppliedEffort } =
+    await importFreshEffortModule({
+      provider: 'vertex',
+      supportsCodexReasoningEffort: false,
+      routeId: 'vertex',
+      catalogEntries: [
+        {
+          id: 'vertex-claude-sonnet',
+          apiName: 'claude-sonnet-5',
+          modelDescriptorId: 'claude-sonnet-5',
+        },
+      ],
+      modelDescriptors: {
+        'claude-sonnet-5': {
+          capabilities: { supportsReasoning: true },
+          reasoning: {
+            mode: 'levels',
+            levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+            wireFormat: 'reasoning_effort',
+            disableFormat: 'thinking_type_disabled',
+          },
+        },
+      },
+    })
+
+  expect(getAvailableEffortLevels('claude-sonnet-5')).toEqual([
+    'low', 'medium', 'high', 'xhigh', 'max',
+  ])
+  expect(resolveAppliedEffort('claude-sonnet-5', 'xhigh')).toBe('xhigh')
+  expect(resolveAppliedEffort('claude-sonnet-5', 'max')).toBe('max')
 })
 
 test('effort allowlist is narrowed to the shim isAdaptive||isOpus45 set', async () => {
   // The Anthropic /messages shim only serializes low/medium as
-  // anthropicBody.effort for opus-4-5/4-6/4-7/4-8 and sonnet-4-6. For
+  // anthropicBody.effort for Claude 5, opus-4-5/4-6/4-7/4-8, and sonnet-4-6. For
   // older variants it only emits thinking for high/max — advertising
   // effort for them would silently drop low/medium on the wire.
   const { modelSupportsEffort, getAvailableEffortLevels } =
@@ -374,6 +472,8 @@ test('effort allowlist is narrowed to the shim isAdaptive||isOpus45 set', async 
 
   // Inside the shim set → supported
   for (const model of [
+    'claude-opus-5',
+    'claude-sonnet-5',
     'claude-opus-4-5',
     'claude-opus-4-6',
     'claude-opus-4-7',

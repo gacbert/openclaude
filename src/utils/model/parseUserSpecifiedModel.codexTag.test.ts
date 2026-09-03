@@ -27,7 +27,7 @@ describe('parseUserSpecifiedModel — codex alias 1M tag', () => {
   })
 
   test('the bare codex aliases are unchanged and carry no 1M tag', () => {
-    expect(parseUserSpecifiedModel('codexplan')).toBe('gpt-5.5')
+    expect(parseUserSpecifiedModel('codexplan')).toBe('gpt-5.6-terra')
     expect(parseUserSpecifiedModel('codexspark')).toBe('gpt-5.3-codex-spark')
     expect(has1mContext(parseUserSpecifiedModel('codexplan'))).toBe(false)
     expect(has1mContext(parseUserSpecifiedModel('codexspark'))).toBe(false)

@@ -73,6 +73,27 @@ async function collectStreamEventTypes(responseText: string): Promise<string[]> 
   return events
 }
 
+async function collectStreamedText(responseText: string): Promise<string> {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(responseText))
+      controller.close()
+    },
+  })
+
+  const textParts: string[] = []
+  for await (const event of codexStreamToAnthropic(
+    new Response(stream),
+    'gpt-5.6-sol',
+  )) {
+    const delta = (event as { delta?: { type?: string; text?: string } }).delta
+    if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+      textParts.push(delta.text)
+    }
+  }
+  return textParts.join('')
+}
+
 async function collectStreamedToolCalls(
   responseText: string,
   model: string,
@@ -199,8 +220,8 @@ describe('Codex provider config', () => {
 
     const resolved = resolveProviderRequest({ model: 'codexplan' })
     expect(resolved.transport).toBe('codex_responses')
-    expect(resolved.resolvedModel).toBe('gpt-5.5')
-    expect(resolved.reasoning).toEqual({ effort: 'high' })
+    expect(resolved.resolvedModel).toBe('gpt-5.6-terra')
+    expect(resolved.reasoning).toEqual({ effort: 'medium' })
     expect(resolved.baseUrl).toBe('https://chatgpt.com/backend-api/codex')
   })
 
@@ -225,7 +246,7 @@ describe('Codex provider config', () => {
 
     expect(resolved.transport).toBe('chat_completions')
     expect(resolved.baseUrl).toBe('http://127.0.0.1:8080/v1')
-    expect(resolved.resolvedModel).toBe('gpt-5.5')
+    expect(resolved.resolvedModel).toBe('gpt-5.6-terra')
   })
 
   test('resolves codexplan to Codex transport even when OPENAI_BASE_URL is the string "undefined"', async () => {
@@ -272,7 +293,7 @@ describe('Codex provider config', () => {
     const resolved = resolveProviderRequest()
     expect(resolved.transport).toBe('codex_responses')
     expect(resolved.baseUrl).toBe('https://chatgpt.com/backend-api/codex')
-    expect(resolved.resolvedModel).toBe('gpt-5.5')
+    expect(resolved.resolvedModel).toBe('gpt-5.6-terra')
   })
 
   test('does not override custom base URL for codexplan (e.g., local provider)', async () => {
@@ -1193,6 +1214,66 @@ describe('Codex request translation', () => {
       'message_delta',
       'message_stop',
     ])
+  })
+
+  test('recovers text delivered only on output_text.done (Sol Ultra)', async () => {
+    const responseText = [
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","item":{"id":"msg_1","type":"message","status":"in_progress","content":[],"role":"assistant"},"output_index":0,"sequence_number":0}',
+      '',
+      'event: response.content_part.added',
+      'data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_1","output_index":0,"part":{"type":"output_text","text":""},"sequence_number":1}',
+      '',
+      'event: response.output_text.done',
+      'data: {"type":"response.output_text.done","content_index":0,"item_id":"msg_1","output_index":0,"text":"Ultra final answer","sequence_number":2}',
+      '',
+      'event: response.output_item.done',
+      'data: {"type":"response.output_item.done","item":{"id":"msg_1","type":"message","status":"completed","content":[{"type":"output_text","text":"Ultra final answer"}],"role":"assistant"},"output_index":0,"sequence_number":3}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":2,"output_tokens":3}},"sequence_number":4}',
+      '',
+    ].join('\n')
+
+    expect(await collectStreamedText(responseText)).toBe('Ultra final answer')
+  })
+
+  test('recovers terminal text when output_text.done is omitted', async () => {
+    const responseText = [
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","item":{"id":"msg_1","type":"message","status":"in_progress","content":[],"role":"assistant"},"output_index":0,"sequence_number":0}',
+      '',
+      'event: response.output_item.done',
+      'data: {"type":"response.output_item.done","item":{"id":"msg_1","type":"message","status":"completed","content":[{"type":"output_text","text":"Terminal item answer"}],"role":"assistant"},"output_index":0,"sequence_number":1}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":2,"output_tokens":3}},"sequence_number":2}',
+      '',
+    ].join('\n')
+
+    expect(await collectStreamedText(responseText)).toBe('Terminal item answer')
+  })
+
+  test('does not duplicate text repeated by terminal events', async () => {
+    const responseText = [
+      'event: response.content_part.added',
+      'data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_1","output_index":0,"part":{"type":"output_text","text":""},"sequence_number":0}',
+      '',
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","content_index":0,"delta":"Ultra final ","item_id":"msg_1","output_index":0,"sequence_number":1}',
+      '',
+      'event: response.output_text.done',
+      'data: {"type":"response.output_text.done","content_index":0,"item_id":"msg_1","output_index":0,"text":"Ultra final answer","sequence_number":2}',
+      '',
+      'event: response.output_item.done',
+      'data: {"type":"response.output_item.done","item":{"id":"msg_1","type":"message","status":"completed","content":[{"type":"output_text","text":"Ultra final answer"}],"role":"assistant"},"output_index":0,"sequence_number":3}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":2,"output_tokens":3}},"sequence_number":4}',
+      '',
+    ].join('\n')
+
+    expect(await collectStreamedText(responseText)).toBe('Ultra final answer')
   })
 
   test('recovers tool-call arguments delivered only on output_item.done (spark)', async () => {
