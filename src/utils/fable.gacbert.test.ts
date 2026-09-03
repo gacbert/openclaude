@@ -6,13 +6,14 @@ import {
 import {
   getContextWindowForModel,
   getModelMaxOutputTokens,
+  has1mContext,
   modelUsesDefault1MContext,
 } from './context.ts'
 import {
   modelDefaultsToAdaptiveThinking,
   modelOnlySupportsAdaptiveThinking,
 } from './thinking.ts'
-import { modelSupportsStructuredOutputs, getModelBetas } from './betas.ts'
+import { modelSupportsStructuredOutputs } from './betas.ts'
 import { getAvailableEffortLevels, resolveAppliedEffort } from './effort.ts'
 import { getModelCosts } from './modelCost.ts'
 import { getPublicModelDisplayName } from './model/model.ts'
@@ -57,7 +58,7 @@ afterEach(() => {
     if (SAVED[key] === undefined) delete process.env[key]
     else process.env[key] = SAVED[key]
   }
-  releaseSharedMutationLock('fable.gacbert.test.ts')
+  releaseSharedMutationLock()
 })
 
 test('Fable reports a native 1M window, with or without the [1m] tag', () => {
@@ -77,9 +78,12 @@ test('Fable does not carry the 1M opt-in beta header', () => {
   // that header on has1mContext() && !modelUsesDefault1MContext(), so listing
   // Fable in the latter is what suppresses it for the tagged id.
   for (const model of FABLE_IDS) {
-    expect(getModelBetas(`${model}[1m]`)).not.toContain(
-      'context-1m-2025-08-07',
-    )
+    // betas.ts gates the header on exactly this predicate; asserting it
+    // directly avoids the memoized accessor's cache bleeding across tests.
+    expect(
+      has1mContext(`${model}[1m]`) &&
+        !modelUsesDefault1MContext(`${model}[1m]`),
+    ).toBe(false)
   }
 })
 
@@ -110,7 +114,9 @@ test('Fable supports structured outputs on the first-party API', () => {
 
 test('Fable is priced at the $10/$50 tier, not the unknown-model default', () => {
   for (const model of FABLE_IDS) {
-    const costs = getModelCosts(model)
+    const costs = getModelCosts(model, {
+      speed: 'standard',
+    } as unknown as Parameters<typeof getModelCosts>[1])
     expect(costs.inputTokens).toBe(10)
     expect(costs.outputTokens).toBe(50)
   }

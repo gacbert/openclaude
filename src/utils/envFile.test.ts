@@ -18,6 +18,9 @@ const TEST_ENV_KEYS = [
   'CLAUDE_CODE_USE_OPENAI',
   'CODEX_AUTH_JSON_PATH',
   'CODEX_HOME',
+  'LLMTR_API_KEY',
+  'APISMART_API_KEY',
+  'APISMART_MODEL',
   'OPENAI_API_KEYS',
   'OPENAI_API_KEY',
   'OPENAI_AZURE_STYLE',
@@ -271,6 +274,52 @@ describe('loadEnvFile', () => {
       OPENAI_BASE_URL: 'https://api.openai.com/v1',
       OPENAI_MODEL: 'gpt-4o',
       OPENAI_API_KEYS: 'key-a,key-b',
+    })
+  })
+
+  it('loads documented ApiSmart env-only provider setup values', () => {
+    const filePath = writeTempEnvFile([
+      'APISMART_API_KEY=apismart-key',
+      'APISMART_MODEL=KIMI_K3',
+    ].join('\n'))
+
+    const loaded = loadEnvFile(filePath)
+
+    expect(process.env.APISMART_API_KEY).toBe('apismart-key')
+    expect(process.env.APISMART_MODEL).toBe('KIMI_K3')
+    expect(loaded).toEqual({
+      APISMART_API_KEY: 'apismart-key',
+      APISMART_MODEL: 'KIMI_K3',
+    })
+  })
+
+  it('loads the dedicated LLMTR credential without selecting a route', () => {
+    const filePath = writeTempEnvFile('LLMTR_API_KEY=llmtr-key')
+
+    const loaded = loadEnvFile(filePath)
+
+    expect(process.env.LLMTR_API_KEY).toBe('llmtr-key')
+    expect(process.env.CLAUDE_CODE_USE_OPENAI).toBeUndefined()
+    expect(process.env.OPENAI_BASE_URL).toBeUndefined()
+    expect(loaded).toEqual({ LLMTR_API_KEY: 'llmtr-key' })
+  })
+
+  it('loads documented Concentrate env-only provider setup values', () => {
+    const filePath = writeTempEnvFile([
+      'CONCENTRATE_API_KEY=concentrate-key',
+      'CONCENTRATE_BASE_URL=https://api.concentrate.ai/v1',
+      'CONCENTRATE_MODEL=claude-sonnet-5',
+    ].join('\n'))
+
+    const loaded = loadEnvFile(filePath)
+
+    expect(process.env.CONCENTRATE_API_KEY).toBe('concentrate-key')
+    expect(process.env.CONCENTRATE_BASE_URL).toBe('https://api.concentrate.ai/v1')
+    expect(process.env.CONCENTRATE_MODEL).toBe('claude-sonnet-5')
+    expect(loaded).toEqual({
+      CONCENTRATE_API_KEY: 'concentrate-key',
+      CONCENTRATE_BASE_URL: 'https://api.concentrate.ai/v1',
+      CONCENTRATE_MODEL: 'claude-sonnet-5',
     })
   })
 

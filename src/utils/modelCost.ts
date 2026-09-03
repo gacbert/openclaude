@@ -3,6 +3,7 @@ import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from 
 import { logEvent } from 'src/services/analytics/index.js'
 import { setHasUnknownModelCost } from '../bootstrap/state.js'
 import { isFastModeEnabled } from './fastMode.js'
+import { getModelPricingOverride } from './settings/modelPricing.js'
 import {
   CLAUDE_3_5_HAIKU_CONFIG,
   CLAUDE_3_5_V2_SONNET_CONFIG,
@@ -125,7 +126,7 @@ export const COST_HAIKU_45 = {
   webSearchRequests: 0.01,
 } as const satisfies ModelCosts
 
-const DEFAULT_UNKNOWN_MODEL_COST = COST_TIER_5_25
+export const DEFAULT_UNKNOWN_MODEL_COST = COST_TIER_5_25
 
 /**
  * Get the current Opus cost tier based on fast mode.
@@ -182,21 +183,6 @@ export const MODEL_COSTS: Record<ModelShortName, ModelCosts> = {
 }
 
 /**
- * Return known pricing for a model without logging or substituting an unknown
- * model fallback. Time-limited launch pricing is resolved on every call so a
- * long-lived process cannot retain an expired tier.
- */
-export function getKnownModelCosts(model: string): ModelCosts | undefined {
-  const shortName = getCanonicalName(model)
-  if (
-    shortName === firstPartyNameToCanonical(CLAUDE_SONNET_5_CONFIG.firstParty)
-  ) {
-    return getSonnet5CostTier()
-  }
-  return MODEL_COSTS[shortName]
-}
-
-/**
  * Calculates the USD cost based on token usage and model cost configuration
  */
 function tokensToUSDCost(modelCosts: ModelCosts, usage: Usage): number {
@@ -226,7 +212,34 @@ function tokensToUSDCost(modelCosts: ModelCosts, usage: Usage): number {
   )
 }
 
-export function getModelCosts(model: string, usage: Usage): ModelCosts {
+/**
+ * Return known pricing for a model without logging or substituting an unknown
+ * model fallback. Time-limited launch pricing is resolved on every call so a
+ * long-lived process cannot retain an expired tier.
+ *
+ * gacbert: exported with an optional `usage` — smartRouting and the model-gate
+ * tests call this with the model alone, while upstream's internal callers pass
+ * usage for the fast-mode tier.
+ */
+export function getKnownModelCosts(
+  model: string,
+  usage: { speed?: Usage['speed'] } = {},
+): ModelCosts | undefined {
+  // Custom prices match the exact resolved model id before any canonical
+  // first-party fallback. This intentionally does not normalize case, aliases,
+  // prefixes, route names, or provider-specific identifiers.
+  const override = getModelPricingOverride(model)
+  if (override) {
+    // gacbert: this fork's ModelCosts prices 1-hour cache writes separately,
+    // but the user-facing modelPricing setting has no field for it. Derive it
+    // from the 5-minute write rate at Anthropic's standard ratio (5m write is
+    // 1.25x input, 1h write is 2x input, so 1h = 1.6x the 5m rate).
+    return {
+      ...override,
+      promptCacheWrite1hTokens: override.promptCacheWriteTokens * 1.6,
+    }
+  }
+
   const shortName = getCanonicalName(model)
 
   // Fast mode is currently available only for Opus 5 and Opus 4.8.
@@ -239,12 +252,33 @@ export function getModelCosts(model: string, usage: Usage): ModelCosts {
     return getOpus46CostTier(isFastMode)
   }
 
-  const costs = getKnownModelCosts(model)
-  if (!costs) {
-    trackUnknownModelCost(model, shortName)
-    return DEFAULT_UNKNOWN_MODEL_COST
+  // gacbert: Sonnet 5 launch pricing is time-limited, so it is resolved on
+  // every call rather than baked into the MODEL_COSTS table.
+  if (
+    shortName === firstPartyNameToCanonical(CLAUDE_SONNET_5_CONFIG.firstParty)
+  ) {
+    return getSonnet5CostTier()
   }
-  return costs
+
+  // MODEL_COSTS is a plain object, so a bare `MODEL_COSTS[shortName]` inherits
+  // Object.prototype members: a model id like `constructor` or `__proto__`
+  // (arbitrary strings for custom/OpenAI-compatible providers, and lowercase so
+  // getCanonicalName passes them through unchanged) would return a truthy
+  // prototype value, skip the unknown-model path, and yield NaN costs downstream.
+  // Match on own properties only.
+  return Object.hasOwn(MODEL_COSTS, shortName)
+    ? MODEL_COSTS[shortName]
+    : undefined
+}
+
+export function getModelCosts(model: string, usage: Usage): ModelCosts {
+  const costs = getKnownModelCosts(model, usage)
+  if (costs) {
+    return costs
+  }
+
+  trackUnknownModelCost(model, getCanonicalName(model))
+  return DEFAULT_UNKNOWN_MODEL_COST
 }
 
 function trackUnknownModelCost(model: string, shortName: ModelShortName): void {
@@ -308,8 +342,10 @@ export function formatModelPricing(costs: ModelCosts): string {
  * Accepts either a short name or full model name
  * Returns undefined if model is not found
  */
-export function getModelPricingString(model: string): string | undefined {
-  const costs = getKnownModelCosts(model)
-  if (!costs) return undefined
-  return formatModelPricing(costs)
+export function getModelPricingString(
+  model: string,
+  usage: { speed?: Usage['speed'] } = {},
+): string | undefined {
+  const costs = getKnownModelCosts(model, usage)
+  return costs ? formatModelPricing(costs) : undefined
 }

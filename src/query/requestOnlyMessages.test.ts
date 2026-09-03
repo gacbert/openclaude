@@ -9,10 +9,14 @@ import {
   createCompactBoundaryMessage,
   createUserMessage,
 } from '../utils/messages.js'
+import { createAttachmentMessage } from '../utils/attachments.js'
 import { INTERRUPTION_CORRECTION_REMINDER } from '../utils/interruptionCorrection.js'
 import { asSystemPrompt } from '../utils/systemPromptType.js'
 
-function makeToolUseContext(tools: Tools = []): QueryParams['toolUseContext'] {
+function makeToolUseContext(
+  tools: Tools = [],
+  effortValue: 'low' | 'medium' | 'high' | undefined = undefined,
+): QueryParams['toolUseContext'] {
   return {
     abortController: new AbortController(),
     getAppState: () => ({
@@ -21,7 +25,7 @@ function makeToolUseContext(tools: Tools = []): QueryParams['toolUseContext'] {
       toolPermissionContext: { mode: 'default' },
       sessionHooks: new Map(),
       mainLoopModel: 'test-model',
-      effortValue: undefined,
+      effortValue,
       advisorModel: undefined,
     }),
     options: {
@@ -187,10 +191,112 @@ test('leaves model messages unchanged when request-only context is absent', asyn
   expect(modelCalls[0]).toEqual(originalMessages)
 })
 
-test('scopes model-request lifecycle callbacks to callModel', async () => {
+test('sends high effort for an ultrathink attachment on the current user turn', async () => {
+  let requestEffort: unknown
+  const params = baseParams(
+    async function* ({ options }) {
+      requestEffort = options.effortValue
+      yield createAssistantMessage({ content: 'done' })
+    },
+    async () => ({ wasCompacted: false }),
+  )
+  params.messages = [
+    createUserMessage({ content: 'ultrathink solve this' }),
+    createAttachmentMessage({ type: 'ultrathink_effort', level: 'high' }),
+  ]
+
+  await collect(params)
+
+  expect(requestEffort).toBe('high')
+})
+
+test('does not let a historical ultrathink attachment affect a later user turn', async () => {
+  let requestEffort: unknown
+  const params = baseParams(
+    async function* ({ options }) {
+      requestEffort = options.effortValue
+      yield createAssistantMessage({ content: 'done' })
+    },
+    async () => ({ wasCompacted: false }),
+  )
+  params.messages = [
+    createUserMessage({ content: 'ultrathink solve this' }),
+    createAttachmentMessage({ type: 'ultrathink_effort', level: 'high' }),
+    createAssistantMessage({ content: 'done' }),
+    createUserMessage({ content: 'ordinary prompt' }),
+  ]
+
+  await collect(params)
+
+  expect(requestEffort).toBeUndefined()
+})
+
+test('does not apply ultrathink effort to a meta-originated prompt', async () => {
+  let requestEffort: unknown
+  const params = baseParams(
+    async function* ({ options }) {
+      requestEffort = options.effortValue
+      yield createAssistantMessage({ content: 'done' })
+    },
+    async () => ({ wasCompacted: false }),
+  )
+  params.messages = [
+    createUserMessage({ content: 'previous user turn' }),
+    createAssistantMessage({ content: 'done' }),
+    createUserMessage({ content: 'ultrathink scheduled task', isMeta: true }),
+    createAttachmentMessage({ type: 'ultrathink_effort', level: 'high' }),
+  ]
+
+  await collect(params)
+
+  expect(requestEffort).toBeUndefined()
+})
+
+test('keeps ultrathink effort when image metadata follows its attachment', async () => {
+  let requestEffort: unknown
+  const params = baseParams(
+    async function* ({ options }) {
+      requestEffort = options.effortValue
+      yield createAssistantMessage({ content: 'done' })
+    },
+    async () => ({ wasCompacted: false }),
+  )
+  params.messages = [
+    createUserMessage({ content: 'ultrathink inspect this image' }),
+    createAttachmentMessage({ type: 'ultrathink_effort', level: 'high' }),
+    createUserMessage({ content: [{ type: 'text', text: 'image metadata' }], isMeta: true }),
+  ]
+
+  await collect(params)
+
+  expect(requestEffort).toBe('high')
+})
+
+test('keeps an explicit effort selection over ultrathink', async () => {
+  let requestEffort: unknown
+  const params = baseParams(
+    async function* ({ options }) {
+      requestEffort = options.effortValue
+      yield createAssistantMessage({ content: 'done' })
+    },
+    async () => ({ wasCompacted: false }),
+  )
+  params.toolUseContext = makeToolUseContext([], 'low')
+  params.messages = [
+    createUserMessage({ content: 'ultrathink solve this' }),
+    createAttachmentMessage({ type: 'ultrathink_effort', level: 'high' }),
+  ]
+
+  await collect(params)
+
+  expect(requestEffort).toBe('low')
+})
+
+test('scopes model-request lifecycle callbacks to provider dispatch', async () => {
   const events: string[] = []
   const params = baseParams(
-    async function* () {
+    async function* ({ options }) {
+      if (options.onProviderRequestStart?.() === false) return
       yield createAssistantMessage({ content: 'done' })
     },
     async () => ({ wasCompacted: false }),
@@ -200,6 +306,29 @@ test('scopes model-request lifecycle callbacks to callModel', async () => {
 
   await collect(params)
 
+  expect(events).toEqual(['start', 'end'])
+})
+
+test('closes the model-request lifecycle when its start callback aborts', async () => {
+  const events: string[] = []
+  let providerDispatched = false
+  const params = baseParams(
+    async function* ({ options }) {
+      if (options.onProviderRequestStart?.() === false) return
+      providerDispatched = true
+      yield createAssistantMessage({ content: 'must not dispatch' })
+    },
+    async () => ({ wasCompacted: false }),
+  )
+  params.onModelRequestStart = () => {
+    events.push('start')
+    params.toolUseContext.abortController.abort('background')
+  }
+  params.onModelRequestEnd = () => events.push('end')
+
+  await collect(params)
+
+  expect(providerDispatched).toBe(false)
   expect(events).toEqual(['start', 'end'])
 })
 

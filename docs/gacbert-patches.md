@@ -164,6 +164,67 @@ Expected:
   default requests omit thinking/sampling, explicit disable remains disabled,
   and xhigh/max stay distinct on Anthropic-shaped shim routes.
 
+## v0.30.0-gacbert.1 (2026-09-03)
+
+Merge of upstream `v0.30.0` (98 commits, v0.26.0 through v0.30.0) preserving the
+full patch set. 18 files conflicted; typecheck is clean afterwards (better than
+the pre-merge baseline, which carried two `permissions.test.ts` errors upstream
+has since fixed).
+
+Conflicts of substance, and how they were resolved:
+
+- **`#2051` codexplan default (v0.28.0).** Upstream moved `codexplan` to GPT-5.6
+  Sol. This fork keeps **Terra**, in `utils/model/configs.ts` (15 `codex:` keys,
+  including upstream's newly-added blocks), `utils/model/model.ts` (4
+  `OPENAI_MODEL ||` defaults plus the `codexplan (...)` label), and
+  `services/api/providerConfig.ts`. The bare `gpt-5.6` alias still resolves to
+  the flagship tier, which is upstream's convention and unrelated to the default.
+- **`#2148` effort exclusions (v0.30.0).** Upstream restructured
+  `legacyModelSupportsEffort` behind a `nativeTransport === 'anthropic'` guard and
+  added a `context` parameter to `legacyModelSupportsMaxEffort`. Took the
+  restructure; re-added `claude-opus-5`, `claude-sonnet-5`, and `claude-fable` to
+  the allowlists. `'ultra'` survives in `EFFORT_LEVELS`, its label, and the
+  `ultra -> max` wire mapping.
+- **`#2147` attribution scoping (v0.30.0).** Took upstream's deferred
+  `attributionEnabled` / `applyAnthropicAttributionPolicy` flow and kept the
+  fork's `ultraSystemPrompt` spread inside the system array, plus its
+  `retryModel` request-model refactor (which subsumes upstream's
+  `providerRequestModel`, since `clientOptions.model` is seeded from it).
+- **openaiShim split.** Upstream split `services/api/openaiShim.ts` into ~20
+  modules and deleted the region holding the fork's
+  `getAnthropicMessagesReasoningFields`. It is **re-homed into
+  `services/api/openaiShim/requestPlanner.ts`**, replacing upstream's inline
+  `isAdaptive` block, and re-exported through `openaiShim.ts`'s `__test` surface.
+  Fable joins Claude 5 in its adaptive set. `ShimRequestParams` gained a
+  `thinking` field, which the request genuinely carries at runtime.
+- **`#2064`/`#2131` model cost.** Took upstream's prototype-member guard and
+  custom-pricing overrides; re-inserted the fork's time-limited Sonnet 5 tier and
+  removed the now-duplicate `getKnownModelCosts`. That function is **exported with
+  an optional `usage`** so the fork's `smartRouting` one-arg call still compiles.
+  A custom override cannot express this fork's 1-hour cache-write field, so it is
+  derived as 1.6x the 5-minute rate (Anthropic's standard ratio).
+- Two upstream relocations left duplicated blocks behind that only the type
+  checker caught: `recordPromptState` (referenced an out-of-scope `system`) and
+  the `logAPIQuery` scalars. Both fork copies were dropped and the fork's one real
+  improvement — a `logThinkingType` that reports `adaptive` instead of mislabeling
+  adaptive turns `disabled` — was re-applied at upstream's new location.
+
+Absorbed from upstream, previously fork-only concerns: nothing in the Claude
+catalog. Upstream v0.30.0 still ships **no** `claude-opus-5`, `claude-sonnet-5`,
+or `claude-fable-*` first-party entries, and its `modelSupports1M()` still stops
+at Opus 4.8 — so `modelUsesDefault1MContext` and the whole Claude 5 / Fable
+surface remain fork-only. `utils/schemaSanitizer.ts` is byte-identical to v0.25.0,
+so the claude.ai connector top-level-`anyOf` 400 is **not** fixed upstream and
+`ENABLE_CLAUDEAI_MCP_SERVERS=false` must stay.
+
+Test posture: the full Bun suite goes 60 -> 66 failures, but the merge **fixes 34**
+and adds 40. Of the 40, 20 are upstream's brand-new `src/memdir/autoExtractFacts`
+tests — that directory is byte-identical to v0.30.0 and fails in isolation, so it
+is upstream's own breakage, not a merge artifact. The other 20 all pass in
+isolation and are the suite's documented order-dependence (global mock and cwd
+leakage). Two upstream cost tests were adapted to this fork's six-field
+`ModelCosts`.
+
 ## v0.25.0-gacbert.4 (2026-09-03)
 
 First-party support for Claude Fable 5 and 5.1. The CLI ships no Fable entry

@@ -21,7 +21,7 @@ import {
 } from '../context.js'
 import { isEnvTruthy } from '../envUtils.js'
 import { getModelStrings, resolveOverriddenModel } from './modelStrings.js'
-import { formatModelPricing, getOpus46CostTier } from '../modelCost.js'
+import { getModelPricingString } from '../modelCost.js'
 import { getSettings_DEPRECATED } from '../settings/settings.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import {
@@ -36,7 +36,7 @@ import { type ModelAlias, isModelAlias } from './aliases.js'
 import { capitalize } from '../stringUtils.js'
 import { DEFAULT_GEMINI_MODEL } from '../providerProfile.js'
 import { getAntModelOverrideConfig, resolveAntModel } from './antModels.js'
-import { getRouteDefaultModel } from '../../integrations/routeMetadata.js'
+import { getRouteDefaultModel, resolveActiveRouteIdFromEnv } from '../../integrations/routeMetadata.js'
 
 export type ModelShortName = string
 export type ModelName = string
@@ -50,6 +50,24 @@ function normalizeModelSetting(value: unknown): ModelName | ModelAlias | undefin
   if (typeof value !== 'string') return undefined
   const trimmed = value.trim()
   return trimmed.length > 0 ? trimmed : undefined
+}
+
+function getUsableProviderConfigModel(value: string | undefined): string | undefined {
+  const normalized = normalizeModelSetting(value)
+  if (!normalized) return undefined
+  const lowercase = normalized.toLowerCase()
+  return lowercase === 'undefined' || lowercase === 'null' ? undefined : normalized
+}
+
+function getAllowedConcentrateConfigModel(): string | undefined {
+  for (const value of [
+    process.env.CONCENTRATE_MODEL,
+    process.env.OPENAI_MODEL,
+  ]) {
+    const model = getUsableProviderConfigModel(value)
+    if (model && isModelAllowed(model)) return model
+  }
+  return undefined
 }
 
 export function getSmallFastModel(): ModelName {
@@ -92,9 +110,9 @@ export function getSmallFastModel(): ModelName {
   if (getAPIProvider() === 'xiaomi-mimo') {
     return process.env.OPENAI_MODEL || 'mimo-v2-flash'
   }
-  // xAI — OPENAI_MODEL carries the active Grok model; fall back to Grok 4.3.
+  // xAI — OPENAI_MODEL carries the active Grok model; fall back to Grok 4.6.
   if (getAPIProvider() === 'xai') {
-    return process.env.OPENAI_MODEL || 'grok-4.3'
+    return process.env.OPENAI_MODEL || getRouteDefaultModel('xai') || 'grok-4.6'
   }
   return getDefaultHaikuModel()
 }
@@ -142,6 +160,7 @@ export function getUserSpecifiedModelSetting(): ModelSetting | undefined {
     // settings.model, so switching from (say) Moonshot to Codex kept firing
     // `kimi-k2.6` at the Codex endpoint and getting 400s.
     const provider = getAPIProvider()
+    const activeRouteId = resolveActiveRouteIdFromEnv(process.env)
     const isOpenAIShimProvider =
       provider === 'openai' ||
       provider === 'codex' ||
@@ -150,14 +169,19 @@ export function getUserSpecifiedModelSetting(): ModelSetting | undefined {
       provider === 'minimax' ||
       provider === 'xiaomi-mimo' ||
       provider === 'xai'
-    specifiedModel =
-      (provider === 'gemini' ? process.env.GEMINI_MODEL : undefined) ||
-      (provider === 'mistral' ? process.env.MISTRAL_MODEL : undefined) ||
-      (provider === 'minimax' ? getMiniMaxModelEnv() : undefined) ||
-      (isOpenAIShimProvider ? process.env.OPENAI_MODEL : undefined) ||
-      (provider === 'firstParty' ? process.env.ANTHROPIC_MODEL : undefined) ||
-      setting ||
-      undefined
+    specifiedModel = activeRouteId === 'concentrate'
+      // Concentrate is an env-only OpenAI-compatible route. Model selection
+      // happens before the client applies its OpenAI-compatible defaults, so
+      // consume its dedicated setting here rather than falling through to a
+      // saved model from an unrelated provider.
+      ? getAllowedConcentrateConfigModel()
+      : (provider === 'gemini' ? process.env.GEMINI_MODEL : undefined) ||
+        (provider === 'mistral' ? process.env.MISTRAL_MODEL : undefined) ||
+        (provider === 'minimax' ? getMiniMaxModelEnv() : undefined) ||
+        (isOpenAIShimProvider ? process.env.OPENAI_MODEL : undefined) ||
+        (provider === 'firstParty' ? process.env.ANTHROPIC_MODEL : undefined) ||
+        setting ||
+        undefined
   }
 
   // Ignore the user-specified model if it's not in the availableModels allowlist.
@@ -231,7 +255,7 @@ export function getDefaultOpusModel(): ModelName {
   }
   // xAI — flagship Grok model for "opus"-equivalent.
   if (getAPIProvider() === 'xai') {
-    return process.env.OPENAI_MODEL || 'grok-4.3'
+    return process.env.OPENAI_MODEL || getRouteDefaultModel('xai') || 'grok-4.6'
   }
   // Microsoft Foundry's built-in `opus` deployment remains on Opus 4.6.
   // An explicitly deployed Opus 5 can still be selected by full name or via
@@ -289,7 +313,7 @@ export function getDefaultSonnetModel(): ModelName {
   }
   // xAI — flagship Grok model for "sonnet"-equivalent.
   if (getAPIProvider() === 'xai') {
-    return process.env.OPENAI_MODEL || 'grok-4.3'
+    return process.env.OPENAI_MODEL || getRouteDefaultModel('xai') || 'grok-4.6'
   }
   // Custom Claude Platform-compatible gateways use the current gateway alias,
   // while built-in Bedrock/Vertex/Foundry aliases remain more conservative.
@@ -342,7 +366,7 @@ export function getDefaultHaikuModel(): ModelName {
   }
   // xAI — use the current Grok default for "haiku"-equivalent until xAI exposes a smaller live alias.
   if (getAPIProvider() === 'xai') {
-    return process.env.OPENAI_MODEL || 'grok-4.3'
+    return process.env.OPENAI_MODEL || getRouteDefaultModel('xai') || 'grok-4.6'
   }
 
   // Haiku 4.5 is available on all platforms (first-party, Foundry, Bedrock, Vertex)
@@ -389,6 +413,13 @@ export function getRuntimeMainLoopModel(params: {
  * @returns The default model setting to use
  */
 export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
+  if (resolveActiveRouteIdFromEnv(process.env) === 'concentrate') {
+    return (
+      getAllowedConcentrateConfigModel() ||
+      getRouteDefaultModel('concentrate') ||
+      'deepseek-v4-flash'
+    )
+  }
   // Custom Anthropic-compatible endpoints intentionally retain the legacy
   // firstParty provider category, so prefer their explicitly configured model
   // before the subscription and PAYG defaults below.
@@ -428,9 +459,9 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
       'nvidia/llama-3.1-nemotron-70b-instruct'
     )
   }
-  // xAI provider: always use the configured Grok model (default grok-4.3)
+  // xAI provider: always use the configured Grok model (default grok-4.6)
   if (getAPIProvider() === 'xai') {
-    return process.env.OPENAI_MODEL || 'grok-4.3'
+    return process.env.OPENAI_MODEL || getRouteDefaultModel('xai') || 'grok-4.6'
   }
   // MiniMax provider: always use the configured MiniMax model.
   // Keep the env-only fallback aligned with the MiniMax descriptor default
@@ -582,9 +613,15 @@ export function renderDefaultModelSetting(
   return renderModelName(parseUserSpecifiedModel(setting))
 }
 
-export function getOpus46PricingSuffix(fastMode: boolean): string {
+export function getOpus46PricingSuffix(
+  fastMode: boolean,
+  model: string = getModelStrings().opus48,
+): string {
   if (!isFirstPartyAnthropicProvider()) return ''
-  const pricing = formatModelPricing(getOpus46CostTier(fastMode))
+  const pricing = getModelPricingString(model, {
+    speed: fastMode ? 'fast' : 'standard',
+  })
+  if (!pricing) return ''
   const fastModeIndicator = fastMode ? ` (${LIGHTNING_BOLT})` : ''
   return ` ·${fastModeIndicator} ${pricing}`
 }
@@ -942,6 +979,29 @@ export function parseUserSpecifiedModel(
     )
   }
   return modelInputTrimmed
+}
+
+// Runtime code needs the concrete model for capabilities and routing, but a
+// custom gateway still distinguishes the legacy codexplan selection from an
+// explicit GPT-5.6 Sol request when applying its default reasoning effort.
+export function getProviderRequestModel(
+  selectedModel: string,
+  runtimeModel: string,
+): string {
+  const selected = selectedModel.trim()
+  const selectedBase = selected
+    .replace(/\[1m]$/i, '')
+    .split('?', 1)[0]
+    ?.toLowerCase()
+  const runtimeBase = runtimeModel
+    .trim()
+    .replace(/\[1m]$/i, '')
+    .split('?', 1)[0]
+    ?.toLowerCase()
+  return selectedBase === 'codexplan' &&
+    runtimeBase === parseUserSpecifiedModel('codexplan')
+    ? selected
+    : runtimeModel
 }
 
 /**

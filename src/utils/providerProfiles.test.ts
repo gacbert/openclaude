@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 
 import { acquireEnvMutex, releaseEnvMutex } from '../entrypoints/sdk/shared.js'
+import { resolveRouteCredentialValue } from '../integrations/routeMetadata.js'
 import type { ProviderProfile } from './config.js'
 
 async function importFreshProvidersModule() {
@@ -70,6 +71,12 @@ const RESTORED_KEYS = [
   'VENICE_API_KEY',
   'MIMO_API_KEY',
   'ATLAS_CLOUD_API_KEY',
+  'APISMART_API_KEY',
+  'APISMART_MODEL',
+  'LLMTR_API_KEY',
+  'CONCENTRATE_API_KEY',
+  'CONCENTRATE_BASE_URL',
+  'CONCENTRATE_MODEL',
   'CLINE_API_KEY',
   'HICAP_API_KEY',
   'CLOUDFLARE_API_TOKEN',
@@ -265,6 +272,39 @@ function buildAtlasCloudProfile(overrides: Partial<ProviderProfile> = {}): Provi
   })
 }
 
+function buildApismartProfile(overrides: Partial<ProviderProfile> = {}): ProviderProfile {
+  return buildProfile({
+    provider: 'apismart',
+    name: 'ApiSmart',
+    baseUrl: 'https://gw.apismart.ai/v1',
+    model: 'DEEPSEEK_V4_FLASH',
+    apiKey: 'apismart-test-key',
+    ...overrides,
+  })
+}
+
+function buildConcentrateProfile(overrides: Partial<ProviderProfile> = {}): ProviderProfile {
+  return buildProfile({
+    provider: 'concentrate',
+    name: 'Concentrate',
+    baseUrl: 'https://api.concentrate.ai/v1',
+    model: 'deepseek-v4-flash-0731',
+    apiKey: 'concentrate-test-key',
+    ...overrides,
+  })
+}
+
+function buildLlmtrProfile(overrides: Partial<ProviderProfile> = {}): ProviderProfile {
+  return buildProfile({
+    provider: 'llmtr',
+    name: 'LLMTR',
+    baseUrl: 'https://llmtr.com/v1',
+    model: 'deepseek/deepseek-v4-flash',
+    apiKey: 'llmtr-test-key',
+    ...overrides,
+  })
+}
+
 function buildClinePassProfile(overrides: Partial<ProviderProfile> = {}): ProviderProfile {
   return buildProfile({
     provider: 'clinepass',
@@ -290,6 +330,50 @@ function buildCloudflareProfile(overrides: Partial<ProviderProfile> = {}): Provi
 }
 
 describe('applyProviderProfileToProcessEnv', () => {
+  test('LLMTR profile clears an ambient dedicated key so its saved key wins', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.LLMTR_API_KEY = 'ambient-old'
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'llmtr',
+        name: 'LLMTR',
+        baseUrl: 'https://llmtr.com/v1',
+        model: 'deepseek/deepseek-v4-flash',
+        apiKey: 'selected-new',
+      }),
+    )
+
+    expect(process.env.LLMTR_API_KEY).toBeUndefined()
+    expect(process.env.OPENAI_API_KEY).toBe('selected-new')
+    expect(
+      resolveRouteCredentialValue({
+        routeId: 'llmtr',
+        baseUrl: process.env.OPENAI_BASE_URL,
+        processEnv: process.env,
+      }),
+    ).toBe('selected-new')
+  }, 20_000)
+
+  test('keyless canonical LLMTR profile adopts its ambient dedicated key', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.LLMTR_API_KEY = 'ambient-llmtr-key'
+
+    applyProviderProfileToProcessEnv(buildLlmtrProfile({ apiKey: undefined }))
+
+    expect(process.env.LLMTR_API_KEY).toBe('ambient-llmtr-key')
+    expect(process.env.OPENAI_API_KEY).toBe('ambient-llmtr-key')
+    expect(
+      resolveRouteCredentialValue({
+        routeId: 'llmtr',
+        baseUrl: process.env.OPENAI_BASE_URL,
+        processEnv: process.env,
+      }),
+    ).toBe('ambient-llmtr-key')
+  }, 20_000)
+
   test('applies Azure-style routing from a saved OpenAI-compatible profile', async () => {
     const { applyProviderProfileToProcessEnv } =
       await importFreshProviderProfileModules()
@@ -304,7 +388,7 @@ describe('applyProviderProfileToProcessEnv', () => {
     )
 
     expect(process.env.OPENAI_AZURE_STYLE).toBe('1')
-  })
+  }, 20_000)
 
   test('openai profile clears competing gemini/github flags', async () => {
     const { applyProviderProfileToProcessEnv } =
@@ -798,6 +882,365 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(process.env.ATLAS_CLOUD_API_KEY).toBe('atlas-test-key')
     expect(getFreshAPIProvider()).toBe('openai')
   })
+
+  test('apismart profile applies OpenAI-compatible env with APISMART_API_KEY mirror', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.CLAUDE_CODE_USE_GEMINI = '1'
+
+    applyProviderProfileToProcessEnv(buildApismartProfile())
+    const { getAPIProvider: getFreshAPIProvider } =
+      await importFreshProvidersModule()
+
+    expect(process.env.CLAUDE_CODE_USE_GEMINI).toBeUndefined()
+    expect(String(process.env.CLAUDE_CODE_USE_OPENAI)).toBe('1')
+    expect(process.env.OPENAI_BASE_URL).toBe('https://gw.apismart.ai/v1')
+    expect(process.env.OPENAI_MODEL).toBe('DEEPSEEK_V4_FLASH')
+    expect(process.env.OPENAI_API_KEY).toBe('apismart-test-key')
+    expect(process.env.APISMART_API_KEY).toBe('apismart-test-key')
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('apismart')
+    expect(getFreshAPIProvider()).toBe('openai')
+  })
+
+  test('apismart profile clears a stale route-specific model before applying its saved model', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.APISMART_MODEL = 'KIMI_K3'
+
+    applyProviderProfileToProcessEnv(buildApismartProfile())
+
+    expect(process.env.APISMART_MODEL).toBeUndefined()
+    expect(process.env.OPENAI_MODEL).toBe('DEEPSEEK_V4_FLASH')
+  })
+
+  test('apismart profile without a base URL retains its dedicated credential for the default route', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(buildApismartProfile({ baseUrl: undefined }))
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://gw.apismart.ai/v1')
+    expect(process.env.OPENAI_API_KEY).toBe('apismart-test-key')
+    expect(process.env.APISMART_API_KEY).toBe('apismart-test-key')
+  })
+
+  test('retargeted ApiSmart profile withholds its dedicated credential', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildApismartProfile({ baseUrl: 'https://proxy.example/v1' }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://proxy.example/v1')
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+    expect(process.env.APISMART_API_KEY).toBeUndefined()
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('apismart')
+  })
+
+  test('keyless ApiSmart profile resolves APISMART_API_KEY without persisting it', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.APISMART_API_KEY = 'ambient-apismart-key'
+
+    applyProviderProfileToProcessEnv(
+      buildApismartProfile({
+        apiKey: undefined,
+        baseUrl: 'https://gw.apismart.ai/v1',
+      }),
+    )
+
+    expect(process.env.OPENAI_API_KEY).toBe('ambient-apismart-key')
+    expect(process.env.APISMART_API_KEY).toBe('ambient-apismart-key')
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('apismart')
+  }, 20_000)
+
+  test('keyless ApiSmart profile without a base URL resolves the ambient key as canonical', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.APISMART_API_KEY = 'ambient-apismart-key'
+
+    applyProviderProfileToProcessEnv(
+      buildApismartProfile({
+        apiKey: undefined,
+        baseUrl: undefined,
+      }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://gw.apismart.ai/v1')
+    expect(process.env.OPENAI_API_KEY).toBe('ambient-apismart-key')
+    expect(process.env.APISMART_API_KEY).toBe('ambient-apismart-key')
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('apismart')
+  }, 20_000)
+
+  test('keyless canonical ApiSmart profile never promotes a generic OpenAI key', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.OPENAI_API_KEY = 'generic-openai-key'
+
+    applyProviderProfileToProcessEnv(
+      buildApismartProfile({
+        apiKey: undefined,
+        baseUrl: 'https://gw.apismart.ai/v1',
+      }),
+    )
+
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+    expect(process.env.APISMART_API_KEY).toBeUndefined()
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('apismart')
+  }, 20_000)
+
+  test('keyless custom ApiSmart profile preserves route identity without forwarding the ambient key', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.APISMART_API_KEY = 'ambient-apismart-key'
+    process.env.OPENAI_API_KEY = 'ambient-apismart-key'
+
+    applyProviderProfileToProcessEnv(
+      buildApismartProfile({
+        apiKey: undefined,
+        baseUrl: 'https://proxy.example.com/v1',
+      }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://proxy.example.com/v1')
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+    expect(process.env.APISMART_API_KEY).toBeUndefined()
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('apismart')
+  }, 20_000)
+
+  test('non-canonical ApiSmart host path withholds the dedicated credential', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildApismartProfile({ baseUrl: 'https://gw.apismart.ai/staging/v1' }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://gw.apismart.ai/staging/v1')
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+    expect(process.env.APISMART_API_KEY).toBeUndefined()
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('apismart')
+  })
+
+  test('concentrate profile applies OpenAI-compatible env with CONCENTRATE_API_KEY mirror', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.CLAUDE_CODE_USE_GEMINI = '1'
+
+    applyProviderProfileToProcessEnv(buildConcentrateProfile())
+    const { getAPIProvider: getFreshAPIProvider } =
+      await importFreshProvidersModule()
+
+    expect(process.env.CLAUDE_CODE_USE_GEMINI).toBeUndefined()
+    expect(String(process.env.CLAUDE_CODE_USE_OPENAI)).toBe('1')
+    expect(process.env.OPENAI_BASE_URL).toBe('https://api.concentrate.ai/v1')
+    expect(process.env.OPENAI_MODEL).toBe('deepseek-v4-flash-0731')
+    expect(process.env.OPENAI_API_KEY).toBe('concentrate-test-key')
+    expect(process.env.CONCENTRATE_API_KEY).toBe('concentrate-test-key')
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('concentrate')
+    expect(getFreshAPIProvider()).toBe('openai')
+  })
+
+  test('generic OpenAI profile at the canonical Concentrate endpoint keeps its credential generic', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    const { getProviderValidationError } = await import(
+      `./providerValidation.js?ts=${Date.now()}-${Math.random()}`
+    )
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'openai',
+        baseUrl: 'https://api.concentrate.ai/v1',
+        model: 'deepseek-v4-flash-0731',
+        apiKey: 'generic-concentrate-key',
+      }),
+    )
+
+    expect(process.env.OPENAI_API_KEY).toBe('generic-concentrate-key')
+    expect(process.env.CONCENTRATE_API_KEY).toBeUndefined()
+    expect(await getProviderValidationError(process.env)).toBeNull()
+  })
+
+  test('concentrate profile clears a stale route-specific model before applying its saved model', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.CONCENTRATE_MODEL = 'claude-sonnet-5'
+
+    applyProviderProfileToProcessEnv(buildConcentrateProfile())
+
+    expect(process.env.CONCENTRATE_MODEL).toBeUndefined()
+    expect(process.env.OPENAI_MODEL).toBe('deepseek-v4-flash-0731')
+  })
+
+  test('concentrate profile without a base URL retains its dedicated credential for the default route', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildConcentrateProfile({ baseUrl: undefined }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://api.concentrate.ai/v1')
+    expect(process.env.OPENAI_API_KEY).toBe('concentrate-test-key')
+    expect(process.env.CONCENTRATE_API_KEY).toBe('concentrate-test-key')
+  })
+
+  test('retargeted Concentrate profile withholds its dedicated credential', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildConcentrateProfile({ baseUrl: 'https://proxy.example/v1' }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://proxy.example/v1')
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+    expect(process.env.CONCENTRATE_API_KEY).toBeUndefined()
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('concentrate')
+  })
+
+  test('retargeted Concentrate profiles retain generic proxy capabilities', async () => {
+    const { addProviderProfile, applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    const saved = addProviderProfile({
+      provider: 'concentrate',
+      name: 'Concentrate proxy',
+      baseUrl: 'https://proxy.example/v1',
+      model: 'proxy-model',
+      apiKey: 'concentrate-test-key',
+      apiFormat: 'responses',
+      authHeader: 'X-Proxy-Key',
+      authScheme: 'raw',
+      authHeaderValue: 'proxy-auth-value',
+      customHeaders: { 'X-Proxy-Trace': 'enabled' },
+    })
+
+    expect(saved).toMatchObject({
+      apiFormat: 'responses',
+      authHeader: 'X-Proxy-Key',
+      authScheme: 'raw',
+      authHeaderValue: 'proxy-auth-value',
+      customHeaders: { 'X-Proxy-Trace': 'enabled' },
+    })
+
+    applyProviderProfileToProcessEnv(saved!)
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://proxy.example/v1')
+    expect(process.env.OPENAI_API_FORMAT).toBe('responses')
+    expect(process.env.OPENAI_AUTH_HEADER).toBe('X-Proxy-Key')
+    expect(process.env.OPENAI_AUTH_SCHEME).toBe('raw')
+    expect(process.env.OPENAI_AUTH_HEADER_VALUE).toBe('proxy-auth-value')
+    expect(process.env.ANTHROPIC_CUSTOM_HEADERS).toBe(
+      'X-Proxy-Trace: enabled',
+    )
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+    expect(process.env.CONCENTRATE_API_KEY).toBeUndefined()
+  })
+
+  test('keyless Concentrate profile resolves CONCENTRATE_API_KEY without persisting it', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.CONCENTRATE_API_KEY = 'ambient-concentrate-key'
+
+    applyProviderProfileToProcessEnv(
+      buildConcentrateProfile({
+        apiKey: undefined,
+        baseUrl: 'https://api.concentrate.ai/v1',
+      }),
+    )
+
+    expect(process.env.OPENAI_API_KEY).toBe('ambient-concentrate-key')
+    expect(process.env.CONCENTRATE_API_KEY).toBe('ambient-concentrate-key')
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('concentrate')
+  }, 20_000)
+
+  test('keyless canonical Concentrate profile never promotes a generic OpenAI key', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.OPENAI_API_KEY = 'generic-openai-key'
+
+    applyProviderProfileToProcessEnv(
+      buildConcentrateProfile({
+        apiKey: undefined,
+        baseUrl: 'https://api.concentrate.ai/v1',
+      }),
+    )
+
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+    expect(process.env.CONCENTRATE_API_KEY).toBeUndefined()
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('concentrate')
+  }, 20_000)
+
+  test('non-canonical Concentrate host path withholds the dedicated credential', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildConcentrateProfile({
+        baseUrl: 'https://api.concentrate.ai/staging/v1',
+      }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe(
+      'https://api.concentrate.ai/staging/v1',
+    )
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+    expect(process.env.CONCENTRATE_API_KEY).toBeUndefined()
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('concentrate')
+  })
+
+  test.each(['SUA_CHAVE', 'sua_chave', 'null', 'undefined', ' NULL '])(
+    'addProviderProfile drops placeholder Concentrate credential %s',
+    async placeholder => {
+      const { addProviderProfile, getProviderProfiles } =
+        await importFreshProviderProfileModules()
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [],
+        activeProviderProfileId: undefined,
+      }))
+
+      const saved = addProviderProfile({
+        provider: 'concentrate',
+        name: 'Concentrate',
+        baseUrl: 'https://api.concentrate.ai/v1',
+        model: 'deepseek-v4-flash-0731',
+        apiKey: placeholder,
+      })
+
+      expect(saved?.apiKey).toBeUndefined()
+      expect(getProviderProfiles()[0]?.apiKey).toBeUndefined()
+    },
+  )
+
+  test.each(['SUA_CHAVE', 'sua_chave', 'null', 'undefined', ' NULL '])(
+    'addProviderProfile drops placeholder ApiSmart credential %s',
+    async placeholder => {
+      const { addProviderProfile, getProviderProfiles } =
+        await importFreshProviderProfileModules()
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [],
+        activeProviderProfileId: undefined,
+      }))
+
+      const saved = addProviderProfile({
+        provider: 'apismart',
+        name: 'ApiSmart',
+        baseUrl: 'https://gw.apismart.ai/v1',
+        model: 'DEEPSEEK_V4_FLASH',
+        apiKey: placeholder,
+      })
+
+      expect(saved?.apiKey).toBeUndefined()
+      expect(getProviderProfiles()[0]?.apiKey).toBeUndefined()
+    },
+  )
 
   test('cloudflare profile applies OpenAI-compatible env with CLOUDFLARE_API_TOKEN mirror', async () => {
     // Account-scoped URL: a real user has substituted `<ACCOUNT_ID>` for their
@@ -1416,6 +1859,87 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(process.env.ANTHROPIC_MODEL).toBe('claude-sonnet-4-6')
     expect(process.env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS).toBeUndefined()
   })
+
+  test('retargeted LLMTR profile withholds its dedicated credential', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildLlmtrProfile({ baseUrl: 'https://proxy.example/v1' }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://proxy.example/v1')
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+    expect(process.env.LLMTR_API_KEY).toBeUndefined()
+  })
+
+  test('query-bearing LLMTR profiles retain generic proxy capabilities', async () => {
+    const { addProviderProfile, applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.LLMTR_API_KEY = 'ambient-llmtr-key'
+
+    const saved = addProviderProfile({
+      provider: 'llmtr',
+      name: 'LLMTR query proxy',
+      baseUrl: 'https://llmtr.com/v1?tenant=proxy',
+      model: 'proxy-model',
+      apiKey: 'saved-llmtr-key',
+      apiFormat: 'responses',
+      authHeader: 'X-Proxy-Key',
+      authScheme: 'raw',
+      authHeaderValue: 'proxy-auth-value',
+      customHeaders: { 'X-Proxy-Trace': 'enabled' },
+    })
+
+    applyProviderProfileToProcessEnv(saved!)
+
+    expect(process.env.OPENAI_API_FORMAT).toBe('responses')
+    expect(process.env.OPENAI_AUTH_HEADER).toBe('X-Proxy-Key')
+    expect(process.env.OPENAI_AUTH_HEADER_VALUE).toBe('proxy-auth-value')
+    expect(process.env.ANTHROPIC_CUSTOM_HEADERS).toBe(
+      'X-Proxy-Trace: enabled',
+    )
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+    expect(process.env.LLMTR_API_KEY).toBeUndefined()
+  })
+
+  test('retargeted LLMTR profiles retain generic proxy capabilities', async () => {
+    const { addProviderProfile, applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    const saved = addProviderProfile({
+      provider: 'llmtr',
+      name: 'LLMTR proxy',
+      baseUrl: 'https://proxy.example/v1',
+      model: 'proxy-model',
+      apiKey: 'llmtr-test-key',
+      apiFormat: 'responses',
+      authHeader: 'X-Proxy-Key',
+      authScheme: 'raw',
+      authHeaderValue: 'proxy-auth-value',
+      customHeaders: { 'X-Proxy-Trace': 'enabled' },
+    })
+
+    expect(saved).toMatchObject({
+      apiFormat: 'responses',
+      authHeader: 'X-Proxy-Key',
+      authScheme: 'raw',
+      authHeaderValue: 'proxy-auth-value',
+      customHeaders: { 'X-Proxy-Trace': 'enabled' },
+    })
+
+    applyProviderProfileToProcessEnv(saved!)
+
+    expect(process.env.OPENAI_API_FORMAT).toBe('responses')
+    expect(process.env.OPENAI_AUTH_HEADER).toBe('X-Proxy-Key')
+    expect(process.env.OPENAI_AUTH_SCHEME).toBe('raw')
+    expect(process.env.OPENAI_AUTH_HEADER_VALUE).toBe('proxy-auth-value')
+    expect(process.env.ANTHROPIC_CUSTOM_HEADERS).toBe(
+      'X-Proxy-Trace: enabled',
+    )
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+    expect(process.env.LLMTR_API_KEY).toBeUndefined()
+  })
 })
 
 describe('getProviderProfiles', () => {
@@ -1532,6 +2056,7 @@ describe('clearActiveProviderProfile', () => {
     expect(process.env.OPENAI_BASE_URL).toBeUndefined()
     expect(process.env.OPENAI_API_KEY).toBeUndefined()
   })
+
 })
 
 describe('Anthropic sentinel survives profile management (#1426)', () => {
@@ -2105,8 +2630,8 @@ describe('applyActiveProviderProfileFromConfig', () => {
     // Regression: the Codex OAuth profile is created with a single
     // `codexplan` model entry, so profileSupportsModel rejected any other
     // Codex model saved via /model (e.g. gpt-5.6-terra) and the next startup
-    // silently reverted to codexplan → gpt-5.5. Codex-backend profiles must
-    // accept every Codex alias model and gpt-5.x free-text picks.
+    // silently reverted to the model behind codexplan. Codex-backend profiles
+    // must accept every Codex alias model and gpt-5.x free-text picks.
     const {
       _setSavedModelOverrideForTesting,
       applyActiveProviderProfileFromConfig,
@@ -2593,7 +3118,7 @@ describe('getProviderPresetDefaults', () => {
     expect(defaults.provider).toBe('xai')
     expect(defaults.name).toBe('xAI')
     expect(defaults.baseUrl).toBe('https://api.x.ai/v1')
-    expect(defaults.model).toBe('grok-4.3')
+    expect(defaults.model).toBe('grok-4.6')
     expect(defaults.apiKey).toBe('xai-live-key')
     expect(defaults.requiresApiKey).toBe(true)
   })
@@ -3116,6 +3641,172 @@ describe('setActiveProviderProfile', () => {
         OPENAI_API_KEY: 'cloudflare-test-token',
         CLOUDFLARE_API_TOKEN: 'cloudflare-test-token',
       })
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('retargeted ApiSmart profiles keep route identity but persist without their dedicated credential', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const apismartProfile = buildApismartProfile({
+        id: 'apismart_proxy',
+        baseUrl: 'https://proxy.example/v1',
+      })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [apismartProfile],
+      }))
+
+      const result = setActiveProviderProfile('apismart_proxy', { configDir })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('apismart_proxy')
+      expect(persisted.profile).toBe('openai')
+      expect(persisted.env).toEqual({
+        CLAUDE_CODE_PROVIDER_ROUTE_ID: 'apismart',
+        OPENAI_BASE_URL: 'https://proxy.example/v1',
+        OPENAI_MODEL: 'DEEPSEEK_V4_FLASH',
+      })
+
+      const { buildStartupEnvFromProfile } = await import(
+        `./providerProfile.js?ts=${Date.now()}-${Math.random()}`
+      )
+      const startupEnv = await buildStartupEnvFromProfile({
+        persisted,
+        processEnv: {
+          APISMART_API_KEY: 'ambient-apismart-key',
+          OPENAI_API_KEY: 'ambient-apismart-key',
+        },
+      })
+
+      expect(startupEnv.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('apismart')
+      expect(startupEnv.APISMART_API_KEY).toBeUndefined()
+      expect(startupEnv.OPENAI_API_KEY).toBeUndefined()
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('retargeted Concentrate profiles keep route identity but persist without their dedicated credential', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const concentrateProfile = buildConcentrateProfile({
+        id: 'concentrate_proxy',
+        baseUrl: 'https://api.concentrate.ai/staging/v1',
+      })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [concentrateProfile],
+      }))
+
+      const result = setActiveProviderProfile('concentrate_proxy', { configDir })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('concentrate_proxy')
+      expect(persisted.profile).toBe('openai')
+      expect(persisted.env).toEqual({
+        CLAUDE_CODE_PROVIDER_ROUTE_ID: 'concentrate',
+        OPENAI_BASE_URL: 'https://api.concentrate.ai/staging/v1',
+        OPENAI_MODEL: 'deepseek-v4-flash-0731',
+      })
+
+      const { buildStartupEnvFromProfile } = await import(
+        `./providerProfile.js?ts=${Date.now()}-${Math.random()}`
+      )
+      const startupEnv = await buildStartupEnvFromProfile({
+        persisted,
+        processEnv: {
+          CONCENTRATE_API_KEY: 'ambient-concentrate-key',
+          OPENAI_API_KEY: 'ambient-concentrate-key',
+        },
+      })
+
+      expect(startupEnv.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('concentrate')
+      expect(startupEnv.CONCENTRATE_API_KEY).toBeUndefined()
+      expect(startupEnv.OPENAI_API_KEY).toBeUndefined()
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('keyed canonical LLMTR profiles persist their saved dedicated credential across restart', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const llmtrProfile = buildLlmtrProfile({ id: 'llmtr_profile' })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [llmtrProfile],
+      }))
+
+      const result = setActiveProviderProfile('llmtr_profile', { configDir })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('llmtr_profile')
+      expect(persisted.profile).toBe('openai')
+      expect(persisted.env).toMatchObject({
+        OPENAI_BASE_URL: 'https://llmtr.com/v1',
+        OPENAI_MODEL: 'deepseek/deepseek-v4-flash',
+        OPENAI_API_KEY: 'llmtr-test-key',
+        LLMTR_API_KEY: 'llmtr-test-key',
+      })
+
+      const { buildStartupEnvFromProfile } = await import(
+        `./providerProfile.js?ts=${Date.now()}-${Math.random()}`
+      )
+      const startupEnv = await buildStartupEnvFromProfile({
+        persisted,
+        processEnv: {
+          LLMTR_API_KEY: 'ambient-unrelated-key',
+        },
+      })
+
+      expect(startupEnv.OPENAI_API_KEY).toBe('llmtr-test-key')
+      expect(startupEnv.LLMTR_API_KEY).toBe('llmtr-test-key')
+
+      delete persisted.env.LLMTR_API_KEY
+      const migratedStartupEnv = await buildStartupEnvFromProfile({
+        persisted,
+        processEnv: {
+          LLMTR_API_KEY: 'ambient-unrelated-key',
+        },
+      })
+
+      expect(migratedStartupEnv.OPENAI_API_KEY).toBe('llmtr-test-key')
+      expect(migratedStartupEnv.LLMTR_API_KEY).toBe('llmtr-test-key')
     } finally {
       process.chdir(originalCwd)
       rmSync(tempDir, { recursive: true, force: true })

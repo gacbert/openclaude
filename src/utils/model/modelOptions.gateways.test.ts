@@ -44,8 +44,6 @@ const originalEnv = {
   ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
   ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL,
   ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
-  ANTHROPIC_DEFAULT_SONNET_MODEL:
-    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL,
   OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
   ATLAS_CLOUD_API_KEY: process.env.ATLAS_CLOUD_API_KEY,
   CODEX_API_KEY: process.env.CODEX_API_KEY,
@@ -118,6 +116,21 @@ test('Kimi Code keeps context variants distinct in the active route picker', asy
   expect(options.find(option => option.value === 'k3-256k')?.label).toBe('Kimi K3 (256K)')
 })
 
+test('Z.AI surfaces GLM-5.3 exactly once ahead of GLM-5.2 without changing the default', async () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.z.ai/api/coding/paas/v4'
+  process.env.OPENAI_MODEL = 'glm-5.2'
+  process.env.OPENAI_API_KEY = 'sk-zai-test'
+
+  const options = await getOpenAIModelOptions()
+  const values = options.map(option => option.value)
+
+  expect(values.filter(value => value === 'glm-5.3')).toHaveLength(1)
+  expect(values.indexOf('glm-5.3')).toBeLessThan(values.indexOf('glm-5.2'))
+  expect(options.find(option => option.value === 'glm-5.3')?.label).toBe('GLM-5.3')
+  expect(options.find(option => option.value === null)?.description).toContain('glm-5.2')
+})
+
 test('custom Anthropic endpoints use the third-party default description', async () => {
   process.env.ANTHROPIC_BASE_URL = 'https://proxy.example/v1'
   process.env.ANTHROPIC_MODEL = 'proxy-model'
@@ -128,6 +141,75 @@ test('custom Anthropic endpoints use the third-party default description', async
 
   expect(defaultOption?.description).toContain('currently proxy-model')
   expect(defaultOption?.description).not.toContain('$')
+})
+
+test('custom Anthropic endpoints omit first-party pricing from every model option', async () => {
+  process.env.ANTHROPIC_BASE_URL = 'https://proxy.example/v1'
+  process.env.ANTHROPIC_API_KEY = 'proxy-key'
+
+  const { getModelOptions } = await importFreshModelOptionsModule('firstParty')
+  const options = getModelOptions()
+
+  expect(options.length).toBeGreaterThan(1)
+  for (const option of options) {
+    expect(option.description).not.toContain('$')
+  }
+})
+
+test('OpenRouter active profile cache merges with the static route catalog', async () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://openrouter.ai/api/v1'
+  process.env.OPENAI_MODEL = 'qwen/qwen3-32b'
+  process.env.OPENROUTER_API_KEY = 'sk-openrouter-test'
+
+  saveGlobalConfig(current => ({
+    ...current,
+    providerProfiles: [
+      {
+        id: 'openrouter-profile',
+        name: 'OpenRouter',
+        provider: 'openrouter',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        model: 'qwen/qwen3-32b',
+      },
+    ],
+    activeProviderProfileId: 'openrouter-profile',
+    openaiAdditionalModelOptionsCacheByProfile: {
+      'openrouter-profile': [
+        {
+          value: 'qwen/qwen3-32b',
+          label: 'Qwen3 32B',
+          description: 'Provider: OpenRouter',
+        },
+      ],
+    },
+  }))
+
+  const values = (await getOpenAIModelOptions()).map(option => option.value)
+
+  expect(values).toContain('qwen/qwen3-32b')
+  expect(values).toContain('openai/gpt-5-mini')
+  expect(values).toContain('x-ai/grok-4.6')
+  expect(values).toContain('x-ai/grok-4.5')
+})
+
+test('Atlas Cloud canonicalizes static catalog aliases without hiding the catalog', async () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.atlascloud.ai/v1'
+  process.env.OPENAI_MODEL = 'claude-opus-4-8'
+  process.env.ATLAS_CLOUD_API_KEY = 'sk-atlas-test'
+
+  const values = (await getOpenAIModelOptions()).map(option => option.value)
+
+  expect(values).toContain('anthropic/claude-opus-4.8')
+  expect(values).toContain('deepseek-ai/deepseek-v4-pro')
+  expect(values).toContain('xai/grok-build-0.1')
+  expect(values).toContain('xai/grok-4.6')
+  expect(values).toContain('xai/grok-4.5')
+  expect(values).toContain('xai/grok-4.3')
+  expect(values).not.toContain('claude-opus-4-8')
+  expect(values).not.toContain('grok-code-fast-1')
+  expect(values).not.toContain('grok-4')
 })
 
 test('first-party picker exposes Claude 5 defaults without redundant 1M variants', async () => {
@@ -188,56 +270,4 @@ test('Foundry picker retains the built-in Opus 4.6 alias', async () => {
     .getModelOptions()
     .find(option => option.value === 'opus')
   expect(opus?.description).toContain('Opus 4.6')
-})
-
-test('OpenRouter active profile cache merges with the static route catalog', async () => {
-  process.env.CLAUDE_CODE_USE_OPENAI = '1'
-  process.env.OPENAI_BASE_URL = 'https://openrouter.ai/api/v1'
-  process.env.OPENAI_MODEL = 'qwen/qwen3-32b'
-  process.env.OPENROUTER_API_KEY = 'sk-openrouter-test'
-
-  saveGlobalConfig(current => ({
-    ...current,
-    providerProfiles: [
-      {
-        id: 'openrouter-profile',
-        name: 'OpenRouter',
-        provider: 'openrouter',
-        baseUrl: 'https://openrouter.ai/api/v1',
-        model: 'qwen/qwen3-32b',
-      },
-    ],
-    activeProviderProfileId: 'openrouter-profile',
-    openaiAdditionalModelOptionsCacheByProfile: {
-      'openrouter-profile': [
-        {
-          value: 'qwen/qwen3-32b',
-          label: 'Qwen3 32B',
-          description: 'Provider: OpenRouter',
-        },
-      ],
-    },
-  }))
-
-  const values = (await getOpenAIModelOptions()).map(option => option.value)
-
-  expect(values).toContain('qwen/qwen3-32b')
-  expect(values).toContain('openai/gpt-5-mini')
-})
-
-test('Atlas Cloud canonicalizes static catalog aliases without hiding the catalog', async () => {
-  process.env.CLAUDE_CODE_USE_OPENAI = '1'
-  process.env.OPENAI_BASE_URL = 'https://api.atlascloud.ai/v1'
-  process.env.OPENAI_MODEL = 'claude-opus-4-8'
-  process.env.ATLAS_CLOUD_API_KEY = 'sk-atlas-test'
-
-  const values = (await getOpenAIModelOptions()).map(option => option.value)
-
-  expect(values).toContain('anthropic/claude-opus-4.8')
-  expect(values).toContain('deepseek-ai/deepseek-v4-pro')
-  expect(values).toContain('xai/grok-build-0.1')
-  expect(values).toContain('xai/grok-4.3')
-  expect(values).not.toContain('claude-opus-4-8')
-  expect(values).not.toContain('grok-code-fast-1')
-  expect(values).not.toContain('grok-4')
 })

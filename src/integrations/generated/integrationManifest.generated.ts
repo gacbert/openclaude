@@ -91,6 +91,21 @@ export const PROVIDER_PRESET_MANIFEST = [
     ]
   },
   {
+    "preset": "apismart",
+    "routeKind": "gateway",
+    "routeId": "apismart",
+    "vendorId": "openai",
+    "gatewayId": "apismart",
+    "description": "ApiSmart unified OpenAI-compatible gateway",
+    "apiKeyEnvVars": [
+      "APISMART_API_KEY"
+    ],
+    "modelEnvVars": [
+      "APISMART_MODEL",
+      "OPENAI_MODEL"
+    ]
+  },
+  {
     "preset": "atlas-cloud",
     "routeKind": "gateway",
     "routeId": "atlas-cloud",
@@ -162,6 +177,24 @@ export const PROVIDER_PRESET_MANIFEST = [
     ]
   },
   {
+    "preset": "concentrate",
+    "routeKind": "gateway",
+    "routeId": "concentrate",
+    "vendorId": "openai",
+    "gatewayId": "concentrate",
+    "description": "Concentrate AI — 150+ models via OpenAI-compatible API",
+    "apiKeyEnvVars": [
+      "CONCENTRATE_API_KEY"
+    ],
+    "baseUrlEnvVars": [
+      "CONCENTRATE_BASE_URL"
+    ],
+    "modelEnvVars": [
+      "CONCENTRATE_MODEL",
+      "OPENAI_MODEL"
+    ]
+  },
+  {
     "preset": "deepseek",
     "routeKind": "vendor",
     "routeId": "deepseek",
@@ -214,6 +247,21 @@ export const PROVIDER_PRESET_MANIFEST = [
     "description": "Hicap OpenAI-compatible gateway",
     "apiKeyEnvVars": [
       "HICAP_API_KEY"
+    ],
+    "modelEnvVars": [
+      "OPENAI_MODEL"
+    ]
+  },
+  {
+    "preset": "llmtr",
+    "routeKind": "gateway",
+    "routeId": "llmtr",
+    "vendorId": "openai",
+    "gatewayId": "llmtr",
+    "description": "LLMTR OpenAI-compatible multi-model gateway",
+    "apiKeyEnvVars": [
+      "LLMTR_API_KEY",
+      "OPENAI_API_KEY"
     ],
     "modelEnvVars": [
       "OPENAI_MODEL"
@@ -527,16 +575,19 @@ export const ORDERED_PROVIDER_PRESETS = [
   "anthropic",
   "dashscope-cn",
   "dashscope-intl",
+  "apismart",
   "atlas-cloud",
   "azure-openai",
   "bankr",
   "clinepass",
   "cloudflare",
+  "concentrate",
   "deepseek",
   "fireworks",
   "gemini",
   "groq",
   "hicap",
+  "llmtr",
   "lmstudio",
   "atomic-chat",
   "ollama",

@@ -48,3 +48,10 @@ test('getHardcodedTeammateModelFallback preserves the provider-aware model ID', 
     'us.anthropic.claude-opus-5',
   )
 })
+
+test('getHardcodedTeammateModelFallback returns the Codex default (GPT-5.6 Sol) for codex', async () => {
+  const { getHardcodedTeammateModelFallback } =
+    await importFreshTeammateModelModule('codex')
+
+  expect(getHardcodedTeammateModelFallback()).toBe('gpt-5.6-sol')
+})

@@ -84,6 +84,11 @@ type OpenAIShimReasoningSupportContext = {
   useRuntimeFallback?: boolean
 }
 
+type ReasoningCompatibilityOverrides = {
+  thinkingRequestFormat?: OpenAIShimThinkingRequestFormat
+  removeBodyFields?: string[]
+}
+
 export type ReasoningControlContext = OpenAIShimReasoningSupportContext & {
   apiProvider?: ReturnType<typeof getAPIProvider>
   supportsCodexReasoningEffort?: boolean | ((model: string) => boolean)
@@ -217,7 +222,9 @@ function normalizeDeepSeekReasoningEffort(
 
 function normalizeZaiReasoningEffort(
   effort: OpenAIShimEffortLevel,
-): 'high' | 'max' {
+  supportsLowEffort = false,
+): 'low' | 'high' | 'max' {
+  if (supportsLowEffort && effort === 'low') return 'low'
   return effort === 'xhigh' || effort === 'max' ? 'max' : 'high'
 }
 
@@ -226,6 +233,7 @@ function resolveCompatibilityWireFormat(
   thinkingRequestFormat?: OpenAIShimThinkingRequestFormat,
   routeIdOverride?: string | null,
   useRuntimeFallback = true,
+  processEnv: NodeJS.ProcessEnv = process.env,
 ): ReasoningWireFormat | undefined {
   if (thinkingRequestFormat === 'deepseek-compatible') {
     return 'deepseek_compatible'
@@ -240,7 +248,7 @@ function resolveCompatibilityWireFormat(
   const routeId = routeIdOverride !== undefined
     ? routeIdOverride
     : useRuntimeFallback
-    ? resolveActiveRouteIdFromEnv(process.env)
+    ? resolveActiveRouteIdFromEnv(processEnv)
     : undefined
   if (!routeId || routeId === 'anthropic' || routeId === 'openai') {
     return undefined
@@ -261,9 +269,10 @@ function resolveCompatibilityReasoningControl(
   context?: ReasoningControlContext,
 ): ReasoningControlResolution | undefined {
   const useRuntimeFallback = context?.useRuntimeFallback ?? true
+  const processEnv = context?.processEnv ?? process.env
   const runtimeShimConfig = context?.openaiShimConfig ?? (useRuntimeFallback && thinkingRequestFormat === undefined && removeBodyFields === undefined
     ? resolveOpenAIShimRuntimeContext({
-      processEnv: process.env,
+      processEnv,
       model,
     }).openaiShimConfig
     : undefined)
@@ -271,20 +280,29 @@ function resolveCompatibilityReasoningControl(
     thinkingRequestFormat ?? runtimeShimConfig?.thinkingRequestFormat
   const resolvedRemoveBodyFields =
     removeBodyFields ?? runtimeShimConfig?.removeBodyFields
+  if (
+    resolvedThinkingRequestFormat === 'none' ||
+    resolvedRemoveBodyFields?.includes('reasoning_effort')
+  ) {
+    return {
+      supportsReasoning: false,
+      controllable: false,
+      levels: [],
+      source: 'compat',
+    }
+  }
   const wireFormat = resolveCompatibilityWireFormat(
     model,
     resolvedThinkingRequestFormat,
     context?.routeId,
     useRuntimeFallback,
+    processEnv,
   )
   if (!wireFormat) {
     return undefined
   }
 
   if (wireFormat === 'deepseek_compatible') {
-    if (resolvedRemoveBodyFields?.includes('reasoning_effort')) {
-      return undefined
-    }
     return {
       supportsReasoning: true,
       controllable: true,
@@ -297,9 +315,7 @@ function resolveCompatibilityReasoningControl(
   }
 
   if (wireFormat === 'zai_compatible') {
-    const reasoningEffortStripped =
-      resolvedRemoveBodyFields?.includes('reasoning_effort') === true
-    const levels: EffortLevel[] = supportsZaiReasoningEffort(model) && !reasoningEffortStripped
+    const levels: EffortLevel[] = supportsZaiReasoningEffort(model)
       ? ['high', 'xhigh']
       : ['high']
     return {
@@ -323,11 +339,12 @@ function resolveCatalogReasoningMetadata(
   capabilities?: CapabilityFlags
   reasoning?: ReasoningControlMetadata
 } | undefined {
+  const processEnv = context?.processEnv ?? process.env
   const routeId = context?.routeId !== undefined
     ? context.routeId
     : context?.useRuntimeFallback === false
     ? undefined
-    : resolveActiveRouteIdFromEnv(process.env)
+    : resolveActiveRouteIdFromEnv(processEnv)
   if (!routeId || routeId === 'anthropic') {
     return undefined
   }
@@ -344,7 +361,7 @@ function resolveCatalogReasoningMetadata(
   const entries = context?.catalogEntries ?? getCatalogEntriesForRoute(routeId)
   let entry = entries.find(matchesModel)
   const fallbackBaseUrl =
-    context?.baseUrl ?? context?.processEnv?.OPENAI_BASE_URL ?? process.env.OPENAI_BASE_URL ?? process.env.OPENAI_API_BASE
+    context?.baseUrl ?? processEnv.OPENAI_BASE_URL ?? processEnv.OPENAI_API_BASE
   if (
     !entry &&
     routeId === 'custom' &&
@@ -423,21 +440,103 @@ function resolveMetadataReasoningControl(
   }
 }
 
+function resolveConfigured3PReasoningControl(
+  model: string,
+  context?: ReasoningControlContext,
+): ReasoningControlResolution | undefined {
+  const apiProvider = getReasoningApiProvider(context)
+  if (get3PModelCapabilityOverride(model, 'effort', apiProvider) !== true) {
+    return undefined
+  }
+
+  const levels: EffortLevel[] = ['low', 'medium', 'high']
+  if (
+    get3PModelCapabilityOverride(model, 'xhigh_effort', apiProvider) === true
+  ) {
+    levels.push('xhigh')
+  }
+  if (
+    get3PModelCapabilityOverride(model, 'max_effort', apiProvider) === true
+  ) {
+    levels.push('max')
+  }
+
+  return {
+    supportsReasoning: true,
+    controllable: true,
+    mode: 'levels',
+    levels,
+    defaultLevel: getLegacyDefaultEffortForModel(model, context),
+    wireFormat: 'reasoning_effort',
+    source: 'capability',
+  }
+}
+
+type NativeLegacyEffortTransport = 'anthropic' | 'gemini'
+
+function resolveNativeLegacyEffortTransport(
+  model: string,
+  context?: ReasoningControlContext,
+): NativeLegacyEffortTransport | undefined {
+  const useRuntimeFallback = context?.useRuntimeFallback ?? true
+  const runtimeShimConfig = context?.openaiShimConfig ?? (
+    useRuntimeFallback
+      ? resolveOpenAIShimRuntimeContext({
+        processEnv: context?.processEnv ?? process.env,
+        baseUrl: context?.baseUrl,
+        model,
+      }).openaiShimConfig
+      : undefined
+  )
+  const endpointPath = runtimeShimConfig?.endpointPath
+  if (endpointPath === '/messages') return 'anthropic'
+  if (endpointPath?.startsWith('/models/gemini-')) return 'gemini'
+
+  const apiProvider = getReasoningApiProvider(context)
+  if (
+    apiProvider === 'firstParty' ||
+    apiProvider === 'bedrock' ||
+    apiProvider === 'vertex' ||
+    apiProvider === 'foundry' ||
+    apiProvider === 'github'
+  ) {
+    return 'anthropic'
+  }
+  return apiProvider === 'gemini' ? 'gemini' : undefined
+}
+
+function modelMatchesNativeLegacyTransport(
+  model: string,
+  transport: NativeLegacyEffortTransport | undefined,
+): boolean {
+  const normalized = model.toLowerCase()
+  return transport === 'anthropic'
+    ? normalized.includes('haiku') ||
+      normalized.includes('sonnet') ||
+      normalized.includes('opus')
+    : transport === 'gemini' && normalized.includes('gemini-')
+}
+
 function legacyModelSupportsEffort(
   model: string,
   context?: ReasoningControlContext,
 ): boolean {
   const m = model.toLowerCase()
-  if (isEnvTruthy(process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT)) {
-    return true
-  }
-  const supported3P = get3PModelCapabilityOverride(model, 'effort')
+  const supported3P = get3PModelCapabilityOverride(
+    model,
+    'effort',
+    getReasoningApiProvider(context),
+  )
   if (supported3P !== undefined) {
     return supported3P
   }
-  if (modelUsesOpenAIEffort(model, context) && modelSupportsCodexReasoningEffort(model, context)) {
+  if (
+    modelUsesOpenAIEffort(model, context) &&
+    modelSupportsCodexReasoningEffort(model, context)
+  ) {
     return true
   }
+  const nativeTransport = resolveNativeLegacyEffortTransport(model, context)
   // Claude 4 models that support effort. Mirrors the Anthropic /messages
   // shim's isAdaptive || isOpus45 set (openaiShim.ts:2292-2297) — only
   // these models serialize low/medium as anthropicBody.effort. Older
@@ -445,19 +544,36 @@ function legacyModelSupportsEffort(
   // high/max, so advertising effort for them would silently drop
   // low/medium on the wire. The substring match also covers prefix
   // variations (e.g. `claude-opus-4-7`, `opencode-claude-opus-4-8`).
-  if (m.includes('claude-opus-5') || m.includes('claude-sonnet-5') ||
+  if (
+    nativeTransport === 'anthropic' &&
+    (m.includes('claude-opus-5') || m.includes('claude-sonnet-5') ||
+      m.includes('claude-fable') ||
       m.includes('opus-4-5') || m.includes('opus-4-6') ||
       m.includes('opus-4-7') || m.includes('opus-4-8') ||
-      m.includes('sonnet-4-6')) {
+      m.includes('sonnet-4-6'))
+  ) {
     return true
   }
   // OpenCode Gemini models that support thinking via /models/gemini-* endpoint
-  if (m.includes('gemini-3')) {
+  if (nativeTransport === 'gemini' && m.includes('gemini-3')) {
     return true
   }
-  // Exclude any other known legacy models (haiku, older opus/sonnet variants)
-  if (m.includes('haiku') || m.includes('sonnet') || m.includes('opus')) {
+  // Native model names need an authorized native transport before force-enable
+  // or provider defaults may add an incompatible field to a generic shim.
+  if (
+    m.includes('haiku') ||
+    m.includes('sonnet') ||
+    m.includes('opus') ||
+    m.includes('gemini-')
+  ) {
     return false
+  }
+  if (
+    isEnvTruthy(
+      (context?.processEnv ?? process.env).CLAUDE_CODE_ALWAYS_ENABLE_EFFORT,
+    )
+  ) {
+    return true
   }
 
   // IMPORTANT: Do not change the default effort support without notifying
@@ -497,15 +613,40 @@ function resolveLegacyReasoningControl(
 export function resolveModelReasoningControl(
   model: string,
   context?: ReasoningControlContext,
+  compatibilityOverrides?: ReasoningCompatibilityOverrides,
 ): ReasoningControlResolution {
   const metadata = resolveMetadataReasoningControl(model, context)
-  if (metadata?.source === 'metadata') {
+  const compatibility = resolveCompatibilityReasoningControl(
+    model,
+    compatibilityOverrides?.thinkingRequestFormat,
+    compatibilityOverrides?.removeBodyFields,
+    context,
+  )
+  if (compatibility && !compatibility.controllable) {
+    return compatibility
+  }
+  if (metadata?.source === 'metadata' || metadata?.supportsReasoning === false) {
     return metadata
   }
 
-  const compatibility = resolveCompatibilityReasoningControl(model, undefined, undefined, context)
   if (compatibility) {
     return compatibility
+  }
+
+  const configured3P = resolveConfigured3PReasoningControl(model, context)
+  if (configured3P) {
+    return configured3P
+  }
+
+  const nativeTransport = resolveNativeLegacyEffortTransport(model, context)
+  if (
+    metadata?.source === 'capability' &&
+    modelMatchesNativeLegacyTransport(model, nativeTransport)
+  ) {
+    const nativeLegacy = resolveLegacyReasoningControl(model, context)
+    if (nativeLegacy.controllable) {
+      return nativeLegacy
+    }
   }
 
   if (metadata) {
@@ -517,13 +658,6 @@ export function resolveModelReasoningControl(
 
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
 export function modelSupportsEffort(model: string, context?: ReasoningControlContext): boolean {
-  if (isEnvTruthy(process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT)) {
-    return true
-  }
-  const supported3P = get3PModelCapabilityOverride(model, 'effort')
-  if (supported3P !== undefined) {
-    return supported3P
-  }
   return resolveModelReasoningControl(model, context).controllable
 }
 
@@ -533,63 +667,15 @@ export function modelSupportsShimReasoningEffort(
   removeBodyFields?: string[],
   context?: ReasoningControlContext,
 ): boolean {
-  if (isEnvTruthy(process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT)) {
-    return true
-  }
-  const supported3P = get3PModelCapabilityOverride(model, 'effort')
-  if (supported3P !== undefined) {
-    return supported3P
-  }
-
-  const metadata = resolveMetadataReasoningControl(
+  const control = resolveModelReasoningControl(
     model,
     context,
+    { thinkingRequestFormat, removeBodyFields },
   )
-  if (metadata?.source === 'metadata') {
-    return Boolean(metadata.controllable && metadataWireFormatSupportsEffort(metadata.wireFormat))
-  }
-
-  const compatibility = resolveCompatibilityReasoningControl(
-    model,
-    thinkingRequestFormat,
-    removeBodyFields,
-    context,
-  )
-  if (compatibility) {
-    return compatibility.controllable
-  }
-
-  if (
-    context?.routeId &&
-    (context.routeId === 'openai' || context.routeId === 'codex') &&
-    !removeBodyFields?.includes('reasoning_effort')
-  ) {
-    return modelSupportsCodexReasoningEffort(model, context)
-  }
-
-  if (context?.useRuntimeFallback === false) {
-    if (
-      context.routeId == null &&
-      thinkingRequestFormat === undefined &&
-      !removeBodyFields?.includes('reasoning_effort')
-    ) {
-      return resolveLegacyReasoningControl(model, context).controllable
-    }
-    return false
-  }
-
-  const control = metadata ?? resolveLegacyReasoningControl(model, context)
   return Boolean(control.controllable && metadataWireFormatSupportsEffort(control.wireFormat))
 }
 
 export function modelSupportsWireEffort(model: string, context?: ReasoningControlContext): boolean {
-  if (isEnvTruthy(process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT)) {
-    return true
-  }
-  const supported3P = get3PModelCapabilityOverride(model, 'effort')
-  if (supported3P !== undefined) {
-    return supported3P
-  }
   return modelSupportsShimReasoningEffort(model, undefined, undefined, context)
 }
 
@@ -645,8 +731,16 @@ export function resolveOpenAIShimReasoningRequestPlan(options: {
   if (wireFormat === 'zai_compatible') {
     const thinkingType = requestedThinkingType ?? defaultThinkingType
     if (thinkingType === 'disabled') {
+      const supportsLowEffort =
+        metadataWireFormat === 'zai_compatible' &&
+        options.reasoningControl?.levels.includes('low') === true &&
+        options.reasoningControl.disableFormat !== 'thinking_type_disabled'
+      const translatedEffort = supportsLowEffort && options.requestedEffort
+        ? normalizeZaiReasoningEffort(options.requestedEffort, true)
+        : 'low'
       return {
-        thinkingType: 'disabled',
+        thinkingType: supportsLowEffort ? 'enabled' : 'disabled',
+        reasoningEffort: supportsLowEffort ? translatedEffort : undefined,
         wireFormat,
         source,
       }
@@ -661,7 +755,10 @@ export function resolveOpenAIShimReasoningRequestPlan(options: {
         metadataWireFormat !== 'zai_compatible' &&
         supportsZaiReasoningEffort(options.model)
       ))
-      ? normalizeZaiReasoningEffort(options.requestedEffort)
+      ? normalizeZaiReasoningEffort(
+        options.requestedEffort,
+        options.reasoningControl?.levels.includes('low') === true,
+      )
       : undefined
     return {
       thinkingType: shouldEnableThinking ? 'enabled' : undefined,
@@ -696,10 +793,17 @@ export function resolveOpenAIShimReasoningRequestPlan(options: {
   }
 }
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'max' effort.
-// Per API docs, 'max' is supported on Sonnet 5, Opus 5, and recent Opus 4
-// models — other models return an error.
-function legacyModelSupportsMaxEffort(model: string): boolean {
-  const supported3P = get3PModelCapabilityOverride(model, 'max_effort')
+// Per API docs, 'max' is supported on Sonnet 5, Opus 5, Fable, and recent
+// Opus 4 models — other models return an error.
+function legacyModelSupportsMaxEffort(
+  model: string,
+  context?: ReasoningControlContext,
+): boolean {
+  const supported3P = get3PModelCapabilityOverride(
+    model,
+    'max_effort',
+    getReasoningApiProvider(context),
+  )
   if (supported3P !== undefined) {
     return supported3P
   }
@@ -730,7 +834,11 @@ function legacyModelSupportsXHighEffort(
   if (!legacyModelSupportsEffort(model, context)) {
     return false
   }
-  const supported3P = get3PModelCapabilityOverride(model, 'xhigh_effort')
+  const supported3P = get3PModelCapabilityOverride(
+    model,
+    'xhigh_effort',
+    getReasoningApiProvider(context),
+  )
   if (supported3P !== undefined) {
     return supported3P
   }
@@ -801,7 +909,7 @@ function getLegacyAvailableEffortLevels(
   if (legacyModelSupportsXHighEffort(model, context)) {
     levels.push('xhigh')
   }
-  if (legacyModelSupportsMaxEffort(model)) {
+  if (legacyModelSupportsMaxEffort(model, context)) {
     levels.push('max')
   }
   if (
@@ -832,7 +940,7 @@ export function modelSupportsMaxEffort(model: string, context?: ReasoningControl
   if (control.source === 'metadata' || control.source === 'capability' || control.source === 'compat') {
     return control.levels.includes('max')
   }
-  return legacyModelSupportsMaxEffort(model)
+  return legacyModelSupportsMaxEffort(model, context)
 }
 
 export function modelSupportsXHighEffort(model: string, context?: ReasoningControlContext): boolean {
