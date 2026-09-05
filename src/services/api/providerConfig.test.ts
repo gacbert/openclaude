@@ -463,13 +463,14 @@ test('resolveProviderRequest resolves the GPT-5.6 family Codex aliases', () => {
   expect(bare.reasoning).toEqual({ effort: 'high' })
 })
 
-test('resolveProviderRequest keeps the implicit Codex fallback on Sol with high reasoning', () => {
+test('resolveProviderRequest keeps the implicit Codex fallback on Terra with medium reasoning', () => {
+  // gacbert: codexplan is Terra in this fork (upstream #2051 moved it to Sol).
   expect(resolveProviderRequest({ processEnv: {} })).toMatchObject({
     requestedModel: 'codexplan',
-    resolvedModel: 'gpt-5.6-sol',
+    resolvedModel: 'gpt-5.6-terra',
     transport: 'codex_responses',
     baseUrl: 'https://chatgpt.com/backend-api/codex',
-    reasoning: { effort: 'high' },
+    reasoning: { effort: 'medium' },
   })
 })
 
@@ -500,10 +501,10 @@ test('resolveProviderRequest scopes GPT-5.6 alias effort defaults to the Codex t
   }
 
   const codexplan = resolveProviderRequest({ model: 'codexplan', processEnv })
-  expect(codexplan.resolvedModel).toBe('gpt-5.6-sol')
+  expect(codexplan.resolvedModel).toBe('gpt-5.6-terra') // fork default, not upstream's Sol
   expect(codexplan.baseUrl).toBe('https://gateway.example/v1')
   expect(codexplan.transport).not.toBe('codex_responses')
-  expect(codexplan.reasoning).toEqual({ effort: 'high' })
+  expect(codexplan.reasoning).toEqual({ effort: 'medium' })
 
   const explicit = resolveProviderRequest({
     model: 'gpt-5.6-sol?reasoning=medium',

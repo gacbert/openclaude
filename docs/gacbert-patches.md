@@ -12,6 +12,13 @@ This fork carries the small runtime fixes required by Bert's Telegram life OS.
   SDK types. The Codex route uses upstream's conservative 272,000-token input
   boundary and 128,000 max output; direct OpenAI keeps its 1.05M catalog
   window. Sol defaults to low effort; Terra and Luna default to medium.
+- GPT-6 Astra (`gpt-6-astra`, 2026-09-05): registered across model
+  descriptors, brands, the direct-OpenAI vendor list, display names, and the
+  Codex picker, with the Responses-route predicate and the Codex family gate
+  widened from `gpt-5.x` to `gpt-(5|6)`. Context is deliberately capped at
+  **272,000** on both catalogs (the API window is 1.05M, but input past 272K is
+  billed 2x / 1.5x). Effort defaults to `medium`; `max` is passed through. It is
+  intentionally absent from `supportsCodexServiceTier` — no Fast tier.
 - Terra default: Codex aliases, `codexplan`, provider recommendations, and
   direct OpenAI/Codex defaults resolve to `gpt-5.6-terra` instead of GPT-5.5.
 - Ultra is a distinct internal mode. Ordinary `max` serializes as `xhigh`;
@@ -145,13 +152,15 @@ Run the focused model/effort checks:
 ```bash
 bun run integrations:check
 bun run typecheck
-bun test src/utils/effort.codex.test.ts src/utils/effort.test.ts src/utils/thinking.test.ts src/utils/fastMode.test.ts src/utils/modelCost.modelGate.test.ts src/services/api/providerConfig.serviceTier.test.ts src/services/api/codexShim.test.ts src/services/api/claude.opus5Request.test.ts src/services/api/client.sonnet5Effort.test.ts src/services/tokenEstimation.test.ts src/utils/sideQuery.test.ts src/services/compact/autoCompact.test.ts src/utils/context.test.ts src/utils/betas.test.ts src/utils/extraUsage.test.ts
+bun test src/services/api/providerConfig.astra.test.ts src/utils/effort.codex.test.ts src/utils/effort.test.ts src/utils/thinking.test.ts src/utils/fastMode.test.ts src/utils/modelCost.modelGate.test.ts src/services/api/providerConfig.serviceTier.test.ts src/services/api/codexShim.test.ts src/services/api/claude.opus5Request.test.ts src/services/api/client.sonnet5Effort.test.ts src/services/tokenEstimation.test.ts src/utils/sideQuery.test.ts src/services/compact/autoCompact.test.ts src/utils/context.test.ts src/utils/betas.test.ts src/utils/extraUsage.test.ts
 ```
 
 Expected:
 
 - `codexplan` and unspecified Codex defaults resolve to `gpt-5.6-terra`.
 - Sol/Terra/Luna report 272,000 context on Codex and 1.05M on direct OpenAI.
+- `gpt-6-astra` reports 272,000 on both routes, takes the Responses route,
+  defaults to `medium`, passes `max` through, and has no Fast tier.
 - Standard max maps to wire `xhigh`; internal Ultra maps to wire `max` and
   injects delegation guidance only on the root turn.
 - Terminal-only Sol text is recovered once without duplicating streamed deltas.
@@ -163,6 +172,52 @@ Expected:
 - Direct first-party `sonnet` resolves to Sonnet 5 with native 1M context;
   default requests omit thinking/sampling, explicit disable remains disabled,
   and xhigh/max stay distinct on Anthropic-shaped shim routes.
+
+## v0.30.0-gacbert.2 (2026-09-05)
+
+Adds **GPT-6 Astra** (`gpt-6-astra`), OpenAI's new-generation flagship released
+2026-09-03/04 above GPT-5.6 Sol. Upstream (v0.30.0 plus the three commits since)
+has no trace of it, and three fork gates keyed on the gpt-5 family would have
+broken it silently: `modelRequiresResponsesApi` sent it to `/v1/chat/completions`
+(where tools + `reasoning_effort` 400 and `max` does not exist), `GPT5_FAMILY_RE`
+made the Codex profile gate replace it with Terra and dropped reasoning effort
+from the request, and a missing `gpt.ts` descriptor fell through to the env
+fallback window. A live probe on the 0.30.0-gacbert.1 bundle confirmed the
+ChatGPT backend serves Astra to the fork's `codex_cli_rs/0.21.0` identity, so no
+client-version bump was needed.
+
+What changed:
+
+- Catalog: `integrations/models/gpt.ts`, `integrations/brands/gpt.ts`, and
+  `integrations/vendors/openai.ts` gain an Astra entry (272,000 / 128,000,
+  effort `low..max`, default `high` on the direct vendor route). Display names
+  in `utils/model/model.ts`; picker entry in `utils/model/modelOptions.ts`.
+- `services/api/providerConfig.ts`: `modelRequiresResponsesApi` is
+  `/^gpt-(?:5\.[4-6]|6)(?!\d)/`; `GPT5_FAMILY_RE` is `/^gpt-(?:5|6)(?:[.-]|$)/`
+  (name kept — the call sites are unchanged); effort table entry
+  `gpt-6-astra -> medium`; `supportsCodexServiceTier` deliberately unchanged.
+- Post-build guards: `GPT-6 Astra catalog` (pins the 272,000 cap), `Codex family
+  gate accepts gpt-6`, `Responses route accepts gpt-6`. All three negative-tested
+  by mutating `dist/cli.mjs`.
+- Tests: new `services/api/providerConfig.astra.test.ts` (7). Four merge-miss
+  expectations from the v0.30.0 merge that still asserted upstream's
+  `codexplan -> Sol` were flipped to this fork's Terra
+  (`providerConfig.test.ts`, `parseUserSpecifiedModel.codexTag.test.ts`); they
+  were failing at `9fb98682` and are unrelated to Astra.
+
+Decisions (Bert, 2026-09-05): the 272K cap dodges the long-context surcharge
+(2x input / 1.5x output past 272K input); no Fast tier for Astra at all (2.5x
+credits on a rationed allowance); Astra usage caps are handled like any other
+Codex cap by the bot's existing failover. Astra's Codex credits are exactly 2x
+Sol's (250 / 25 cached / 1,250 per Mtok) and the plan allowance is rationed
+(Pro-$100: ~25-225 local Codex messages per 5h), so the bot exposes it only as
+an explicit 4-hour `/astra` pin and as the most expensive `/auto` rung.
+
+Test posture: the focused 15-file set is 484 pass / 2 fail; the two
+(`context.test.ts` "Claude 5 models use native 1M context" and `effort.test.ts`
+"modelSupportsXHighEffort") pass in isolation and fail identically at
+`9fb98682` when run in the same Bun process — the suite's documented
+order-dependence, not this release.
 
 ## v0.30.0-gacbert.1 (2026-09-03)
 

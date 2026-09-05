@@ -52,6 +52,13 @@ requireAbsent(
 requireMatches('GPT-5.6 Sol catalog', /gpt-5\.6-sol/)
 requireMatches('GPT-5.6 Terra catalog', /gpt-5\.6-terra/)
 requireMatches('GPT-5.6 Luna catalog', /gpt-5\.6-luna/)
+// GPT-6 Astra: the 272k cap is a deliberate decision (>272k input is billed 2x),
+// so the needle pins the numbers, not just the id.
+requireMatches('GPT-6 Astra catalog', /gptModel\("gpt-6-astra","GPT-6 Astra",272000,128000/)
+// Both gpt-5-family gates must accept gpt-6, or Astra silently drops to
+// chat/completions (no `max`, tools+effort 400) and loses reasoning effort.
+requireMatches('Codex family gate accepts gpt-6', /GPT5_FAMILY_RE=\/\^gpt-\(\?:5\|6\)\(\?:\[\.-\]\|\$\)\//)
+requireMatches('Responses route accepts gpt-6', /\^gpt-\(\?:5\\\.\[4-6\]\|6\)\(\?!\\d\)/)
 requireMatches('Claude Opus 5 catalog', /claude-opus-5/)
 requireMatches('Claude Opus 5 Vertex region override', /VERTEX_REGION_CLAUDE_5_OPUS/)
 requireMatches('Claude Sonnet 5 catalog', /claude-sonnet-5/)

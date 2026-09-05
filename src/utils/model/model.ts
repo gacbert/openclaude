@@ -692,6 +692,7 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
       'gpt-5.6-sol': 'GPT-5.6 Sol',
       'gpt-5.6-terra': 'GPT-5.6 Terra',
       'gpt-5.6-luna': 'GPT-5.6 Luna',
+      'gpt-6-astra': 'GPT-6 Astra',
       'gpt-5.5': 'GPT-5.5',
       'gpt-5.5-mini': 'GPT-5.5 mini',
       'gpt-5.4': 'GPT-5.4',
@@ -732,6 +733,8 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
       return 'GPT-5.6 Terra'
     case 'gpt-5.6-luna':
       return 'GPT-5.6 Luna'
+    case 'gpt-6-astra':
+      return 'GPT-6 Astra'
     case 'gpt-5.5':
       return 'GPT-5.5'
     case 'gpt-5.4':

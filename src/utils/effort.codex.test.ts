@@ -199,6 +199,27 @@ test('gpt-5.4 on the ChatGPT Codex backend supports effort selection', async () 
   ])
 })
 
+test('gpt-6-astra on the ChatGPT Codex backend gets the flagship effort surface', async () => {
+  // gacbert (2026-09-05): Astra is a new generation above Sol. The Codex family
+  // gate now admits gpt-6, so it must expose the same level list as Sol —
+  // including `max` (a real wire value on /v1/responses) and the fork's
+  // internal `ultra` — rather than the truncated list of an unknown model.
+  const { getAvailableEffortLevels, modelSupportsEffort } =
+    await importFreshEffortModule({
+      provider: 'codex',
+      supportsCodexReasoningEffort: true,
+    })
+
+  expect(modelSupportsEffort('gpt-6-astra')).toBe(true)
+  // Same surface as Sol. On the Codex route standard `max` serializes as
+  // wire `xhigh`, and the fork's internal Ultra (wire `max`) is gated
+  // separately in ultraMode.ts — so this list tops out at `xhigh` for both.
+  expect(getAvailableEffortLevels('gpt-6-astra')).toEqual(
+    getAvailableEffortLevels('gpt-5.6-sol'),
+  )
+  expect(getAvailableEffortLevels('gpt-6-astra')).toContain('xhigh')
+})
+
 test('gpt-5.4 on the OpenAI provider still supports effort selection', async () => {
   const { getAvailableEffortLevels, modelSupportsEffort } =
     await importFreshEffortModule({

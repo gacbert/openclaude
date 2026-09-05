@@ -44,6 +44,11 @@ export default [
   gptModel('gpt-5.6-sol', 'GPT-5.6 Sol', 272_000, 128_000),
   gptModel('gpt-5.6-terra', 'GPT-5.6 Terra', 272_000, 128_000),
   gptModel('gpt-5.6-luna', 'GPT-5.6 Luna', 272_000, 128_000),
+  // gacbert: GPT-6 Astra (2026-09-03). The API descriptor is 1.05M context /
+  // 922k input / 128k output, but prompts over 272k input are billed at 2x
+  // input and 1.5x output, so the Codex transport is capped at the same 272k
+  // as the 5.6 family on purpose — a turn never crosses the surcharge cliff.
+  gptModel('gpt-6-astra', 'GPT-6 Astra', 272_000, 128_000),
   // gpt-5.5 via Codex transport caps at ~272k effective input tokens; the
   // 1.05M API descriptor value caused /context to under-report usage and
   // auto-compact to fire too late, yielding 500 "input exceeds the context

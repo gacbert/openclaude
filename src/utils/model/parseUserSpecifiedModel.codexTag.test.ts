@@ -49,27 +49,29 @@ describe('parseUserSpecifiedModel — codex alias 1M tag', () => {
     expect(tagged.match(/\[1m]/gi)?.length).toBe(1)
   })
 
-  test('codexplan display identifies the Sol model', () => {
-    expect(renderModelSetting('codexplan')).toBe('codexplan (gpt-5.6-sol)')
+  test('codexplan display identifies the Terra model', () => {
+    // gacbert: codexplan is Terra in this fork (upstream #2051 moved it to Sol).
+    expect(renderModelSetting('codexplan')).toBe('codexplan (gpt-5.6-terra)')
   })
 
   test('keeps codexplan as the provider request selection after runtime resolution', () => {
-    expect(getProviderRequestModel('codexplan', 'gpt-5.6-sol')).toBe(
+    expect(getProviderRequestModel('codexplan', 'gpt-5.6-terra')).toBe(
       'codexplan',
     )
     expect(getProviderRequestModel('gpt-5.6-sol', 'gpt-5.6-sol')).toBe(
       'gpt-5.6-sol',
     )
-    expect(getProviderRequestModel('codexplan', 'gpt-5.6-terra')).toBe(
-      'gpt-5.6-terra',
+    // A runtime model that is NOT the alias target is passed through as-is.
+    expect(getProviderRequestModel('codexplan', 'gpt-5.6-sol')).toBe(
+      'gpt-5.6-sol',
     )
     expect(
-      getProviderRequestModel('codexplan?reasoning=medium', 'gpt-5.6-sol'),
+      getProviderRequestModel('codexplan?reasoning=medium', 'gpt-5.6-terra'),
     ).toBe('codexplan?reasoning=medium')
     expect(
       getProviderRequestModel(
         'codexplan?reasoning=medium',
-        'gpt-5.6-sol?reasoning=medium',
+        'gpt-5.6-terra?reasoning=medium',
       ),
     ).toBe('codexplan?reasoning=medium')
   })

@@ -454,6 +454,12 @@ function getCodexModelOptions(): ModelOption[] {
       description: 'GPT-5.6 Sol with low reasoning for difficult work',
     },
     {
+      value: 'gpt-6-astra',
+      label: 'gpt-6-astra',
+      description:
+        'GPT-6 Astra with medium reasoning · flagship, 2x Sol credits, rationed',
+    },
+    {
       value: 'gpt-5.6-luna',
       label: 'gpt-5.6-luna',
       description: 'GPT-5.6 Luna with medium reasoning',

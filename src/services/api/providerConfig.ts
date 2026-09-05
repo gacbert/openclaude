@@ -100,6 +100,12 @@ const CODEX_ALIAS_MODELS: Record<
     model: 'gpt-5.6-luna',
     reasoningEffort: 'medium',
   },
+  // gacbert: GPT-6 Astra. 2x Sol's credits with a rationed plan allowance, so
+  // it defaults to medium like Terra/Luna; /effort and the router raise it.
+  'gpt-6-astra': {
+    model: 'gpt-6-astra',
+    reasoningEffort: 'medium',
+  },
   // GPT-5.6 family (July 2026). `gpt-5.6` follows the Codex CLI convention of
   // resolving the bare version to the flagship tier (Sol).
   'gpt-5.6': {
@@ -479,26 +485,30 @@ function shouldUseGithubResponsesApi(model: string): boolean {
   return true
 }
 
-// GPT-5.4/5.5/5.6 (incl. sol/terra/luna suffixes) reject function tools +
-// reasoning_effort on /v1/chat/completions and must use /v1/responses. An
-// agent CLI always sends tools, so plain OpenAI/Azure users can't otherwise
-// reach these models. Matches gpt-5.4/5.5/5.6 with any non-mini/nano
+// GPT-5.4/5.5/5.6 (incl. sol/terra/luna suffixes) and GPT-6 (astra) reject
+// function tools + reasoning_effort on /v1/chat/completions and must use
+// /v1/responses — for Astra, `max` effort only exists there at all. An agent
+// CLI always sends tools, so plain OpenAI/Azure users can't otherwise reach
+// these models. Matches gpt-5.4/5.5/5.6 and gpt-6[.x] with any non-mini/nano
 // suffix. -mini/-nano variants are excluded as unverified — they keep
 // chat/completions, and the OPENAI_API_FORMAT / profile apiFormat override
-// covers them if they turn out to need /responses. Two-digit minors
+// covers them if they turn out to need /responses. Two-digit 5.x minors
 // (gpt-5.10+) are deliberately unmatched: auto-routing unverified future
-// models is the exact risk this predicate exists to avoid. Bare gpt-5,
-// gpt-5-mini, gpt-4.x, o-series, and claude-* stay on chat/completions.
+// models is the exact risk this predicate exists to avoid; gpt-60-style ids
+// are likewise unmatched. Bare gpt-5, gpt-5-mini, gpt-4.x, o-series, and
+// claude-* stay on chat/completions. (gacbert: gpt-6 added 2026-09-05.)
 export function modelRequiresResponsesApi(model: string): boolean {
   const normalized = model.trim().toLowerCase().split('?', 1)[0] ?? ''
-  return /^gpt-5\.[4-6](?!\d)/.test(normalized) &&
+  return /^gpt-(?:5\.[4-6]|6)(?!\d)/.test(normalized) &&
     !GPT5_MINI_NANO_RE.test(normalized)
 }
 
-// The gpt-5 family boundary: gpt-5, gpt-5-*, gpt-5.x — without matching
-// gpt-50-style ids. Shared by supportsCodexReasoningEffort and the Codex
-// profile model gate so the family shape lives in one place.
-const GPT5_FAMILY_RE = /^gpt-5(?:[.-]|$)/
+// The Codex-served GPT family boundary: gpt-5, gpt-5-*, gpt-5.x, and (gacbert,
+// 2026-09-05) gpt-6, gpt-6-*, gpt-6.x — without matching gpt-50/gpt-60-style
+// ids. Shared by supportsCodexReasoningEffort and the Codex profile model gate
+// so the family shape lives in one place. The constant keeps its historical
+// name to avoid churn at the call sites.
+const GPT5_FAMILY_RE = /^gpt-(?:5|6)(?:[.-]|$)/
 const GPT5_MINI_NANO_RE = /(?:^|[-.])(?:mini|nano)(?:[-.]|$)/
 
 // gpt-5 family models the ChatGPT Codex backend can serve. The -mini/-nano
@@ -1557,6 +1567,8 @@ export function supportsCodexReasoningEffort(model: string): boolean {
 // exposes a `priority` service tier (its UI display name is "Fast"; ~1.5x speed,
 // increased usage) for the GPT-5.6 family and legacy gpt-5.5 / gpt-5.4.
 // Spark, mini, gpt-5.3-codex and gpt-5.2 reject the field, so gate strictly.
+// gpt-6-astra is deliberately NOT listed (Bert, 2026-09-05): its Fast tier is
+// 2.5x standard credits on a rationed allowance, so `/fast` is a no-op there.
 export function supportsCodexServiceTier(model: string): boolean {
   const normalized = model.trim().toLowerCase()
   const base = normalized.split('?', 1)[0] ?? normalized
